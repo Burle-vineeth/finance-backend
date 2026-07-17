@@ -9,7 +9,7 @@ const getTransactions = async (req, res) => {
     const transactions = await Transaction.find()
       .populate('client')
       .populate('loan')
-      .sort({ createdAt: -1 });
+      .sort({ date: -1, createdAt: -1 });
     res.status(200).json({ success: true, data: transactions });
   } catch (error) {
     res.status(500).json({ success: false, error: 'Server Error' });
