@@ -60,9 +60,12 @@ const getDashboardMetrics = async (req, res) => {
       // Calculate next payment date
       const loanTransactions = transactions.filter(t => t.loan && t.loan.toString() === loan._id.toString() && t.type === 'REPAYMENT');
       let lastPaymentDate = loan.startDate;
+      let isCollectedToday = false;
+      
       if (loanTransactions.length > 0) {
         loanTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
         lastPaymentDate = loanTransactions[0].date;
+        isCollectedToday = new Date(lastPaymentDate).toDateString() === today.toDateString();
       }
       
       const nextDate = new Date(lastPaymentDate);
@@ -80,7 +83,8 @@ const getDashboardMetrics = async (req, res) => {
         frequency: loan.paymentFrequency,
         expectedPayment: loan.expectedDailyMonthlyPayment,
         pendingAmount: loan.pendingAmount,
-        nextPaymentDate: nextDate
+        nextPaymentDate: nextDate,
+        isCollectedToday
       };
     });
 
