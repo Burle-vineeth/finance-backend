@@ -1,28 +1,42 @@
 const mongoose = require('mongoose');
 
-const transactionSchema = mongoose.Schema(
+const transactionSchema = new mongoose.Schema(
   {
-    title: {
+    type: {
       type: String,
-      required: [true, 'Please add a title'],
+      enum: ['DISBURSEMENT', 'REPAYMENT', 'CAPITAL_INJECTION', 'CAPITAL_WITHDRAWAL'],
+      required: true,
     },
     amount: {
       type: Number,
-      required: [true, 'Please add an amount'],
-    },
-    type: {
-      type: String,
-      enum: ['income', 'expense'],
-      required: [true, 'Please specify if it is income or expense'],
-    },
-    category: {
-      type: String,
-      required: [true, 'Please add a category'],
+      required: [true, 'Please specify the transaction amount'],
     },
     date: {
       type: Date,
       default: Date.now,
     },
+    client: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Client',
+      // Required for Disbursement and Repayment
+    },
+    loan: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Loan',
+      // Required for Disbursement and Repayment
+    },
+    // The "Smart Split" tracking for Repayments
+    principalPortion: {
+      type: Number,
+      default: 0,
+    },
+    profitPortion: {
+      type: Number,
+      default: 0,
+    },
+    notes: {
+      type: String,
+    }
   },
   {
     timestamps: true,

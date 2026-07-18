@@ -23,8 +23,10 @@ if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }
 
-// Routes
+app.use('/api/clients', require('./routes/clientRoutes'));
+app.use('/api/loans', require('./routes/loanRoutes'));
 app.use('/api/transactions', require('./routes/transactionRoutes'));
+app.use('/api/dashboard', require('./routes/dashboardRoutes'));
 
 app.get('/', (req, res) => {
   res.send('Finance Backend API is running');
