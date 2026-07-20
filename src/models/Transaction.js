@@ -4,7 +4,7 @@ const transactionSchema = new mongoose.Schema(
   {
     type: {
       type: String,
-      enum: ['DISBURSEMENT', 'REPAYMENT', 'CAPITAL_INJECTION', 'CAPITAL_WITHDRAWAL'],
+      enum: ['DISBURSEMENT', 'REPAYMENT', 'CAPITAL_INJECTION', 'CAPITAL_WITHDRAWAL', 'BUSINESS_EXPENSE'],
       required: true,
     },
     amount: {
