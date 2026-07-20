@@ -14,6 +14,7 @@ const getDashboardMetrics = async (req, res) => {
     let totalDisbursed = 0;
     let totalRepaid = 0;
     let realizedProfit = 0;
+    let totalExpenses = 0;
     
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -23,6 +24,7 @@ const getDashboardMetrics = async (req, res) => {
       if (t.type === 'CAPITAL_INJECTION') totalCapitalInjected += t.amount;
       if (t.type === 'CAPITAL_WITHDRAWAL') totalCapitalWithdrawn += t.amount;
       if (t.type === 'DISBURSEMENT') totalDisbursed += t.amount;
+      if (t.type === 'BUSINESS_EXPENSE') totalExpenses += t.amount;
       if (t.type === 'REPAYMENT') {
         totalRepaid += t.amount;
         realizedProfit += t.profitPortion || 0;
@@ -36,7 +38,8 @@ const getDashboardMetrics = async (req, res) => {
     });
 
     const totalCapital = totalCapitalInjected - totalCapitalWithdrawn;
-    const cashOnHand = totalCapital - totalDisbursed + totalRepaid;
+    const cashOnHand = totalCapital - totalDisbursed + totalRepaid - totalExpenses;
+    const netProfit = realizedProfit - totalExpenses;
 
     // 2. Calculate Market Metrics from Active Loans
     const activeLoans = await Loan.find({ status: 'ACTIVE' }).populate('client');
@@ -100,6 +103,8 @@ const getDashboardMetrics = async (req, res) => {
           moneyInMarket,
           expectedProfitPending,
           realizedProfit,
+          totalExpenses,
+          netProfit,
           totalEquity,
         },
         collections: {
