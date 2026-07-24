@@ -62,7 +62,7 @@ const getDashboardMetrics = async (req, res) => {
 
       // Calculate next payment date
       const loanTransactions = transactions.filter(t => t.loan && t.loan.toString() === loan._id.toString() && t.type === 'REPAYMENT');
-      let lastPaymentDate = loan.startDate;
+      let lastPaymentDate = loan.collectionStartDate || loan.startDate;
       let isCollectedToday = false;
       
       if (loanTransactions.length > 0) {

@@ -18,7 +18,32 @@ const getLoans = async (req, res) => {
 // @access  Public
 const addLoan = async (req, res) => {
   try {
-    const { client, principalAmount, expectedReturnAmount, paymentFrequency, durationDays, startDate } = req.body;
+    const { client, principalAmount, expectedReturnAmount, paymentFrequency, durationDays, startDate, collectionStartDate } = req.body;
+
+    // Calculate cash on hand
+    const cashStats = await Transaction.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalCapitalInjected: { $sum: { $cond: [{ $eq: ['$type', 'CAPITAL_INJECTION'] }, '$amount', 0] } },
+          totalCapitalWithdrawn: { $sum: { $cond: [{ $eq: ['$type', 'CAPITAL_WITHDRAWAL'] }, '$amount', 0] } },
+          totalDisbursed: { $sum: { $cond: [{ $eq: ['$type', 'DISBURSEMENT'] }, '$amount', 0] } },
+          totalRepaid: { $sum: { $cond: [{ $eq: ['$type', 'REPAYMENT'] }, '$amount', 0] } },
+          totalExpenses: { $sum: { $cond: [{ $eq: ['$type', 'BUSINESS_EXPENSE'] }, '$amount', 0] } },
+        }
+      }
+    ]);
+
+    let cashOnHand = 0;
+    if (cashStats.length > 0) {
+      const stats = cashStats[0];
+      const totalCapital = stats.totalCapitalInjected - stats.totalCapitalWithdrawn;
+      cashOnHand = totalCapital - stats.totalDisbursed + stats.totalRepaid - stats.totalExpenses;
+    }
+
+    if (principalAmount > cashOnHand) {
+      return res.status(400).json({ success: false, error: ['Insufficient cash on hand to disburse this loan'] });
+    }
 
     // Create the loan
     const loan = await Loan.create({
@@ -27,7 +52,8 @@ const addLoan = async (req, res) => {
       expectedReturnAmount,
       paymentFrequency,
       durationDays,
-      startDate: startDate ? new Date(startDate) : new Date()
+      startDate: startDate ? new Date(startDate) : new Date(),
+      collectionStartDate: collectionStartDate ? new Date(collectionStartDate) : undefined
     });
 
     // Automatically log the DISBURSEMENT transaction to keep ledger perfectly in sync
