@@ -59,6 +59,9 @@ const loanSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    collectionStartDate: {
+      type: Date,
+    },
   },
   {
     timestamps: true,
