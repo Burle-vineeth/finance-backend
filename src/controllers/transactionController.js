@@ -65,6 +65,7 @@ const addTransaction = async (req, res) => {
       // Auto-close loan if fully paid
       if (activeLoan.pendingAmount <= 0) {
         activeLoan.status = 'CLOSED';
+        activeLoan.resolvedAt = date ? new Date(date) : new Date();
       }
 
       await activeLoan.save();
@@ -116,6 +117,7 @@ const deleteTransaction = async (req, res) => {
         // If the loan was marked closed but now has pending amount, reactivate it
         if (activeLoan.status === 'CLOSED' && activeLoan.pendingAmount > 0) {
           activeLoan.status = 'ACTIVE';
+          activeLoan.resolvedAt = undefined;
         }
 
         await activeLoan.save();
