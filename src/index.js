@@ -23,10 +23,13 @@ if (process.env.NODE_ENV === 'development') {
   app.use(morgan('dev'));
 }
 
-app.use('/api/clients', require('./routes/clientRoutes'));
-app.use('/api/loans', require('./routes/loanRoutes'));
-app.use('/api/transactions', require('./routes/transactionRoutes'));
-app.use('/api/dashboard', require('./routes/dashboardRoutes'));
+const { authMiddleware } = require('./middleware/authMiddleware');
+
+app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/clients', authMiddleware, require('./routes/clientRoutes'));
+app.use('/api/loans', authMiddleware, require('./routes/loanRoutes'));
+app.use('/api/transactions', authMiddleware, require('./routes/transactionRoutes'));
+app.use('/api/dashboard', authMiddleware, require('./routes/dashboardRoutes'));
 
 app.get('/', (req, res) => {
   res.send('Finance Backend API is running');
