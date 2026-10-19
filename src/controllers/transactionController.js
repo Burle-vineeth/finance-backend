@@ -6,10 +6,13 @@ const Loan = require('../models/Loan');
 // @access  Public
 const getTransactions = async (req, res) => {
   try {
+    // The app only shows the client's name and groups by loan id, so populate just those
+    // fields instead of embedding the full client and loan record in every transaction
     const transactions = await Transaction.find()
-      .populate('client')
-      .populate('loan')
-      .sort({ date: -1, createdAt: -1 });
+      .populate('client', 'name')
+      .populate('loan', '_id')
+      .sort({ date: -1, createdAt: -1 })
+      .lean();
     res.status(200).json({ success: true, data: transactions });
   } catch (error) {
     res.status(500).json({ success: false, error: 'Server Error' });
