@@ -7,8 +7,13 @@ const Loan = require('../models/Loan');
 const getDashboardMetrics = async (req, res) => {
   try {
     // 1. Calculate Capital and Cash Flow from Ledger
-    const transactions = await Transaction.find();
-    
+    // Both reads are independent, so run them together. The ledger is only read here,
+    // so .lean() skips building full Mongoose documents for every transaction.
+    const [transactions, activeLoans] = await Promise.all([
+      Transaction.find().lean(),
+      Loan.find({ status: 'ACTIVE' }).populate('client'),
+    ]);
+
     let totalCapitalInjected = 0;
     let totalCapitalWithdrawn = 0;
     let totalDisbursed = 0;
@@ -42,8 +47,17 @@ const getDashboardMetrics = async (req, res) => {
     const netProfit = realizedProfit - totalExpenses;
 
     // 2. Calculate Market Metrics from Active Loans
-    const activeLoans = await Loan.find({ status: 'ACTIVE' }).populate('client');
-    
+    // Latest repayment per loan, found in one pass instead of re-scanning the whole ledger for every loan
+    const latestRepaymentByLoan = new Map();
+    transactions.forEach(t => {
+      if (t.type !== 'REPAYMENT' || !t.loan) return;
+      const loanId = t.loan.toString();
+      const latest = latestRepaymentByLoan.get(loanId);
+      if (!latest || new Date(t.date) > new Date(latest.date)) {
+        latestRepaymentByLoan.set(loanId, t);
+      }
+    });
+
     let moneyInMarket = 0;
     let expectedProfitPending = 0;
     let totalExpectedDailyCollections = 0;
@@ -61,13 +75,12 @@ const getDashboardMetrics = async (req, res) => {
       }
 
       // Calculate next payment date
-      const loanTransactions = transactions.filter(t => t.loan && t.loan.toString() === loan._id.toString() && t.type === 'REPAYMENT');
+      const latestRepayment = latestRepaymentByLoan.get(loan._id.toString());
       let lastPaymentDate = loan.collectionStartDate || loan.startDate;
       let isCollectedToday = false;
-      
-      if (loanTransactions.length > 0) {
-        loanTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
-        lastPaymentDate = loanTransactions[0].date;
+
+      if (latestRepayment) {
+        lastPaymentDate = latestRepayment.date;
         isCollectedToday = new Date(lastPaymentDate).toDateString() === today.toDateString();
       }
       

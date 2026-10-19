@@ -16,7 +16,9 @@ const app = express();
 app.use(express.json());
 
 // Enable CORS
-app.use(cors());
+// maxAge lets browsers cache the preflight (OPTIONS) check instead of repeating it before
+// almost every API call; browsers cap it at their own maximum (e.g. 2 hours in Chrome)
+app.use(cors({ maxAge: 86400 }));
 
 // Dev logging middleware
 if (process.env.NODE_ENV === 'development') {
