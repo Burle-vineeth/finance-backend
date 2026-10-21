@@ -6,6 +6,25 @@ const appConfigSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    // PIN brute-force protection: wrong guesses since the last lockout, how many lockouts
+    // in a row, and when the current lockout ends
+    failedAttempts: {
+      type: Number,
+      default: 0,
+    },
+    lockCount: {
+      type: Number,
+      default: 0,
+    },
+    lockUntil: {
+      type: Date,
+      default: null,
+    },
+    // Stamped into every token. Bumping it (on PIN change) revokes every token issued before.
+    tokenVersion: {
+      type: Number,
+      default: 0,
+    },
   },
   {
     timestamps: true,
