@@ -1,28 +1,29 @@
 const jwt = require('jsonwebtoken');
-const AppConfig = require('../models/AppConfig');
+const mongoose = require('mongoose');
+const User = require('../models/User');
 
 const TOKEN_TTL = '30d';
 
-// The current config id and token version are cached briefly so a request doesn't cost an extra
-// DB round trip. Changing the PIN updates the cache straight away through rememberTokenVersion.
-const VERSION_CACHE_MS = 30 * 1000;
-let cachedVersion = null;
-let cachedAt = 0;
+// Each user's role, active flag and token version are cached briefly so a request doesn't cost an
+// extra DB round trip. Anything that changes them (PIN change or reset, disabling) calls forgetUser.
+const USER_CACHE_MS = 30 * 1000;
+const userCache = new Map();
 
-const rememberTokenVersion = (config) => {
-  cachedVersion = config ? { configId: String(config._id), tokenVersion: config.tokenVersion || 0 } : null;
-  cachedAt = Date.now();
+const forgetUser = (userId) => {
+  userCache.delete(String(userId));
 };
 
-const getTokenVersion = async () => {
-  if (cachedVersion && Date.now() - cachedAt < VERSION_CACHE_MS) return cachedVersion;
-  // A missing config is not cached, so the first login on a new database is picked up at once
-  rememberTokenVersion(await AppConfig.findOne().select('tokenVersion').lean());
-  return cachedVersion;
+const loadUser = async (userId) => {
+  const cached = userCache.get(userId);
+  if (cached && Date.now() - cached.at < USER_CACHE_MS) return cached.user;
+  const user = await User.findById(userId).select('name username role active tokenVersion').lean();
+  // A missing user is not cached
+  if (user) userCache.set(userId, { user, at: Date.now() });
+  return user;
 };
 
-const signToken = (config) => jwt.sign(
-  { configId: config._id, role: 'admin', tv: config.tokenVersion || 0 },
+const signToken = (user) => jwt.sign(
+  { sub: String(user._id), role: user.role, tv: user.tokenVersion || 0 },
   process.env.JWT_SECRET,
   { algorithm: 'HS256', expiresIn: TOKEN_TTL }
 );
@@ -43,18 +44,28 @@ const authMiddleware = async (req, res, next) => {
   }
 
   try {
-    // Rejects tokens issued before the last PIN change, and old tokens that carry no version
-    const current = await getTokenVersion();
-    if (!current || decoded.configId !== current.configId || decoded.tv !== current.tokenVersion) {
+    // Rejects tokens of disabled users, tokens issued before the user's last PIN change or reset,
+    // and tokens from before user accounts existed (they name no user)
+    const user = mongoose.isValidObjectId(decoded.sub) ? await loadUser(decoded.sub) : null;
+    if (!user || !user.active || decoded.tv !== (user.tokenVersion || 0)) {
       return res.status(401).json({ message: 'Not authorized, token revoked' });
     }
+    // The role comes from the database, not the token, so a role change applies at once
+    req.user = { id: String(user._id), name: user.name, username: user.username, role: user.role };
   } catch (error) {
     console.error('Auth Middleware Error:', error);
     return res.status(500).json({ message: 'Server error' });
   }
 
-  req.user = decoded;
   next();
 };
 
-module.exports = { authMiddleware, signToken, rememberTokenVersion };
+// Lets the request through only for the given roles, e.g. requireRole('ADMIN')
+const requireRole = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({ success: false, message: 'You do not have access to this', error: 'You do not have access to this' });
+  }
+  next();
+};
+
+module.exports = { authMiddleware, requireRole, signToken, forgetUser };

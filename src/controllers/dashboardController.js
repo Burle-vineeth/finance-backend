@@ -1,5 +1,6 @@
 const Transaction = require('../models/Transaction');
 const Loan = require('../models/Loan');
+const { paymentSchedule } = require('../services/schedule');
 
 // @desc    Get dashboard metrics
 // @route   GET /api/dashboard
@@ -76,22 +77,7 @@ const getDashboardMetrics = async (req, res) => {
 
       // Calculate next payment date
       const latestRepayment = latestRepaymentByLoan.get(loan._id.toString());
-      let lastPaymentDate = loan.collectionStartDate || loan.startDate;
-      let isCollectedToday = false;
-
-      if (latestRepayment) {
-        lastPaymentDate = latestRepayment.date;
-        isCollectedToday = new Date(lastPaymentDate).toDateString() === today.toDateString();
-      }
-      
-      const nextDate = new Date(lastPaymentDate);
-      if (loan.paymentFrequency === 'DAILY') {
-        nextDate.setDate(nextDate.getDate() + 1);
-      } else if (loan.paymentFrequency === 'WEEKLY') {
-        nextDate.setDate(nextDate.getDate() + 7);
-      } else if (loan.paymentFrequency === 'MONTHLY') {
-        nextDate.setMonth(nextDate.getMonth() + 1);
-      }
+      const { nextPaymentDate: nextDate, isCollectedToday } = paymentSchedule(loan, latestRepayment?.date, today);
 
       return {
         loanId: loan._id,

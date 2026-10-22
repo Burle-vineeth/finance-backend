@@ -36,7 +36,16 @@ const transactionSchema = new mongoose.Schema(
     },
     notes: {
       type: String,
-    }
+    },
+    // Set when the repayment came from a staff collection that the admin approved
+    collectedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    collectionEntry: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'CollectionEntry',
+    },
   },
   {
     timestamps: true,
