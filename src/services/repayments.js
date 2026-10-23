@@ -1,6 +1,7 @@
 const Loan = require('../models/Loan');
 const Transaction = require('../models/Transaction');
 const { HttpError } = require('../utils/httpError');
+const { dayKey, addDays, keyToDate } = require('./schedule');
 
 const isPositiveAmount = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0;
 
@@ -76,4 +77,21 @@ const applyRepayment = async ({ loanId, amount, date, notes, client, requireActi
   return transaction;
 };
 
-module.exports = { applyRepayment };
+// What was repaid on each loan on an India day ('YYYY-MM-DD'), as a Map of loan id -> amount
+const repaidOnDayByLoan = async (day, loanIds, session = null) => {
+  const repayments = await Transaction.find({
+    type: 'REPAYMENT',
+    loan: { $in: loanIds },
+    // A generous UTC window around the India day, narrowed below
+    date: { $gte: keyToDate(addDays(day, -1)), $lt: keyToDate(addDays(day, 2)) },
+  }).select('loan amount date').session(session).lean();
+  const byLoan = new Map();
+  for (const t of repayments) {
+    if (dayKey(t.date) !== day) continue;
+    const loanId = String(t.loan);
+    byLoan.set(loanId, (byLoan.get(loanId) || 0) + t.amount);
+  }
+  return byLoan;
+};
+
+module.exports = { applyRepayment, repaidOnDayByLoan };

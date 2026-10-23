@@ -1,13 +1,39 @@
+const mongoose = require('mongoose');
 const Loan = require('../models/Loan');
+const Client = require('../models/Client');
 const Transaction = require('../models/Transaction');
+const CollectionEntry = require('../models/CollectionEntry');
+const { loanSchedule, todayKey, dayKey } = require('../services/schedule');
+const { repaidOnDayByLoan } = require('../services/repayments');
+const { withTransaction } = require('../utils/withTransaction');
+const { HttpError, sendError } = require('../utils/httpError');
+
+// The details of a loan that can be corrected after it is created; its amounts and terms can't
+const EDITABLE_FIELDS = ['client', 'startDate', 'collectionStartDate'];
+
+// A picked day, 'YYYY-MM-DD', stored as UTC midnight of that day like the dates of new loans
+const parseDay = (value, label) => {
+  const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00.000Z`) : null;
+  if (!date || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) {
+    throw new HttpError(400, `${label} must be a valid date`);
+  }
+  return date;
+};
 
 // @desc    Get all loans
 // @route   GET /api/loans
 // @access  Public
 const getLoans = async (req, res) => {
   try {
-    const loans = await Loan.find().populate('client').sort({ createdAt: -1 });
-    res.status(200).json({ success: true, data: loans });
+    const loans = await Loan.find().populate('client').sort({ createdAt: -1 }).lean();
+    const today = todayKey();
+    const active = loans.filter((loan) => loan.status === 'ACTIVE');
+    const paidToday = await repaidOnDayByLoan(today, active.map((loan) => loan._id));
+    // Where each active loan stands against its installment schedule
+    const data = loans.map((loan) => (loan.status === 'ACTIVE'
+      ? { ...loan, schedule: loanSchedule(loan, { today, paidToday: paidToday.get(String(loan._id)) || 0 }) }
+      : loan));
+    res.status(200).json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, error: 'Server Error' });
   }
@@ -78,7 +104,104 @@ const addLoan = async (req, res) => {
   }
 };
 
+// @desc    Correct a loan's client, disbursement date or collection start date. The loan's own records
+//          move with it (its disbursement entry, and the repayments and staff entries naming the old client),
+//          all in one transaction, and the change is added to the loan's edit history.
+//          With dryRun: true nothing is saved; the response shows the changes and the schedule before and after.
+// @route   PATCH /api/loans/:id
+// @access  Admin
+const updateLoanDetails = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) throw new HttpError(404, 'Loan not found');
+    const body = req.body || {};
+    const notEditable = Object.keys(body).filter((key) => !EDITABLE_FIELDS.includes(key) && key !== 'dryRun');
+    if (notEditable.length) {
+      throw new HttpError(400, `Only the client, disbursement date and collection start date can be changed (not ${notEditable.join(', ')})`);
+    }
+
+    const result = await withTransaction(async (session) => {
+      const loan = await Loan.findById(req.params.id).populate('client', 'name').session(session);
+      if (!loan) throw new HttpError(404, 'Loan not found');
+      const changes = [];
+
+      const oldClient = loan.client;
+      let newClient = null;
+      if (body.client !== undefined && String(body.client) !== String(oldClient?._id)) {
+        if (!mongoose.isValidObjectId(body.client)) throw new HttpError(400, 'Choose a client');
+        newClient = await Client.findById(body.client).select('name').session(session);
+        if (!newClient) throw new HttpError(404, 'Client not found');
+        changes.push({ field: 'client', from: oldClient?.name || '', to: newClient.name });
+      }
+
+      let newStart = null;
+      if (body.startDate !== undefined) {
+        const date = parseDay(body.startDate, 'Disbursement date');
+        if (dayKey(date) !== dayKey(loan.startDate)) {
+          newStart = date;
+          changes.push({ field: 'startDate', from: dayKey(loan.startDate), to: dayKey(date) });
+        }
+      }
+
+      // undefined: unchanged; null: no collection start date any more
+      let newCollection;
+      if (body.collectionStartDate !== undefined) {
+        const date = body.collectionStartDate === null || body.collectionStartDate === ''
+          ? null
+          : parseDay(body.collectionStartDate, 'Collection start date');
+        const from = loan.collectionStartDate ? dayKey(loan.collectionStartDate) : '';
+        const to = date ? dayKey(date) : '';
+        if (from !== to) {
+          newCollection = date;
+          changes.push({ field: 'collectionStartDate', from, to });
+        }
+      }
+
+      const start = newStart || loan.startDate;
+      const collection = newCollection === undefined ? loan.collectionStartDate : newCollection;
+      if (collection && dayKey(collection) < dayKey(start)) {
+        throw new HttpError(400, 'Collection can\'t start before the loan is disbursed');
+      }
+
+      // The schedule before and after, for the review step in the app
+      const today = todayKey();
+      const paidToday = (await repaidOnDayByLoan(today, [loan._id], session)).get(String(loan._id)) || 0;
+      const current = loan.toObject();
+      const preview = {
+        changes,
+        schedule: loan.status === 'ACTIVE'
+          ? {
+            before: loanSchedule(current, { today, paidToday }),
+            after: loanSchedule({ ...current, startDate: start, collectionStartDate: collection || undefined }, { today, paidToday }),
+          }
+          : null,
+      };
+      if (body.dryRun || !changes.length) return { ...preview, saved: false };
+
+      if (newClient) {
+        loan.client = newClient._id;
+        // Records that name the old client move to the new one; repayments entered without a client stay that way
+        const named = oldClient ? { client: oldClient._id } : { client: { $ne: null } };
+        await Transaction.updateMany({ loan: loan._id, ...named }, { $set: { client: newClient._id } }, { session });
+        await CollectionEntry.updateMany({ loan: loan._id }, { $set: { client: newClient._id } }, { session });
+      }
+      if (newStart) {
+        loan.startDate = newStart;
+        await Transaction.updateMany({ loan: loan._id, type: 'DISBURSEMENT' }, { $set: { date: newStart } }, { session });
+      }
+      if (newCollection !== undefined) loan.collectionStartDate = newCollection || undefined;
+      loan.editHistory.push({ at: new Date(), by: req.user.id, byName: req.user.name, changes });
+      await loan.save({ session });
+      return { ...preview, saved: true };
+    });
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    sendError(res, error, 'Update Loan Error:');
+  }
+};
+
 module.exports = {
   getLoans,
   addLoan,
+  updateLoanDetails,
 };

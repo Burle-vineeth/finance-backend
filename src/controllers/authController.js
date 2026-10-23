@@ -124,7 +124,7 @@ const me = (req, res) => {
 
 // @desc    Change your own PIN and sign out your other devices
 // @route   POST /api/auth/change-pin
-// @access  Private
+// @access  Admin (staff PINs are set by the admin)
 const changePin = async (req, res) => {
   try {
     const { oldPin, newPin } = req.body || {};

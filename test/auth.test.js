@@ -83,15 +83,25 @@ describe('sign-in', () => {
     assert.equal(res.body.user.role, 'STAFF');
   });
 
-  it('changing your PIN signs out your other devices but not other users', async () => {
+  it('the admin changing their PIN signs out their other devices but not other users', async () => {
     const { admin, staff } = await seedTeam();
-    const otherDevice = await login('ravi', '5678');
-    const res = await request(app).post('/api/auth/change-pin').set(auth(staff)).send({ oldPin: '5678', newPin: '4321' });
+    const otherDevice = await login('admin', '1234');
+    const res = await request(app).post('/api/auth/change-pin').set(auth(admin)).send({ oldPin: '1234', newPin: '4321' });
     assert.equal(res.status, 200);
     assert.equal((await request(app).get('/api/auth/me').set(auth(otherDevice))).status, 401);
     assert.equal((await request(app).get('/api/auth/me').set(auth(res.body.token))).status, 200);
-    assert.equal((await request(app).get('/api/auth/me').set(auth(admin))).status, 200);
-    await login('ravi', '4321');
+    assert.equal((await request(app).get('/api/auth/me').set(auth(staff))).status, 200);
+    await login('admin', '4321');
+  });
+
+  it('does not let staff change their own PIN', async () => {
+    const { staff } = await seedTeam();
+    const res = await request(app).post('/api/auth/change-pin').set(auth(staff)).send({ oldPin: '5678', newPin: '4321' });
+    assert.equal(res.status, 403);
+    // The old PIN still works and the new one doesn't
+    await login('ravi', '5678');
+    const withNew = await request(app).post('/api/auth/login').send({ username: 'ravi', pin: '4321' });
+    assert.equal(withNew.status, 401);
   });
 });
 

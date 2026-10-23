@@ -72,7 +72,9 @@ const seedLoan = async ({ principal = 1000, expected = 1200, frequency = 'DAILY'
   return { client, loan };
 };
 
-const today = () => new Date().toISOString().substring(0, 10);
+// Today in India, the day the server counts as today (see services/schedule)
+const { todayKey } = require('../src/services/schedule');
+const today = () => todayKey();
 
 module.exports = {
   app, request, startDb, stopDb, clearDb, auth, seedLegacyPin, login, seedTeam, seedLoan, today,

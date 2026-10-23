@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { installmentCount } = require('../services/schedule');
 
 const loanSchema = new mongoose.Schema(
   {
@@ -65,6 +66,14 @@ const loanSchema = new mongoose.Schema(
     resolvedAt: {
       type: Date,
     },
+    // Corrections made after the loan was created: what changed, from what to what, when and by whom
+    editHistory: [{
+      _id: false,
+      at: { type: Date, default: Date.now },
+      by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      byName: { type: String },
+      changes: [{ _id: false, field: String, from: String, to: String }],
+    }],
   },
   {
     timestamps: true,
@@ -82,17 +91,8 @@ loanSchema.pre('validate', function() {
 
   // Calculate expected payment based on frequency
   if (this.isModified('expectedReturnAmount') || this.isModified('durationDays') || this.isModified('paymentFrequency')) {
-    let numberOfPayments = 1;
-    if (this.paymentFrequency === 'DAILY') {
-      numberOfPayments = this.durationDays;
-    } else if (this.paymentFrequency === 'WEEKLY') {
-      numberOfPayments = Math.ceil(this.durationDays / 7);
-    } else if (this.paymentFrequency === 'MONTHLY') {
-      numberOfPayments = Math.ceil(this.durationDays / 30);
-    }
-    
-    // Default to at least 1 to avoid infinity
-    numberOfPayments = numberOfPayments > 0 ? numberOfPayments : 1; 
+    // The same count the payment schedule uses (at least 1, to avoid dividing by zero)
+    const numberOfPayments = installmentCount(this.paymentFrequency, this.durationDays);
     
     this.expectedDailyMonthlyPayment = parseFloat((this.expectedReturnAmount / numberOfPayments).toFixed(2));
   }

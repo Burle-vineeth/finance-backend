@@ -3,21 +3,16 @@ const CollectionEntry = require('../models/CollectionEntry');
 const Loan = require('../models/Loan');
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
-const { applyRepayment } = require('../services/repayments');
-const { paymentSchedule } = require('../services/schedule');
+const { applyRepayment, repaidOnDayByLoan } = require('../services/repayments');
+const { loanSchedule, todayKey, dayKey } = require('../services/schedule');
 const { withTransaction } = require('../utils/withTransaction');
 const { HttpError, sendError } = require('../utils/httpError');
 
 const STATUSES = ['PENDING', 'APPROVED', 'REJECTED', 'CANCELLED', 'REVERSED'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-const startOfToday = () => {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return today;
-};
-
-const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
+// Same India day (see services/schedule)
+const sameDay = (a, b) => dayKey(a) === dayKey(b);
 
 const parseAmount = (value) => {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -84,26 +79,21 @@ const addWarnings = async (entries) => {
 const getCollectableLoans = async (req, res) => {
   try {
     const loans = await Loan.find({ status: 'ACTIVE' })
-      .select('client paymentFrequency expectedDailyMonthlyPayment pendingAmount startDate collectionStartDate')
+      .select('client paymentFrequency durationDays expectedReturnAmount expectedDailyMonthlyPayment totalRepaid pendingAmount startDate collectionStartDate')
       .populate('client', 'name phone address')
       .lean();
     const loanIds = loans.map((loan) => loan._id);
+    const today = todayKey();
 
-    const [latestRepayments, pendingEntries] = await Promise.all([
-      Transaction.aggregate([
-        { $match: { type: 'REPAYMENT', loan: { $in: loanIds } } },
-        { $group: { _id: '$loan', date: { $max: '$date' } } },
-      ]),
+    const [paidToday, pendingEntries] = await Promise.all([
+      repaidOnDayByLoan(today, loanIds),
       CollectionEntry.find({ loan: { $in: loanIds }, status: 'PENDING' }).select('loan amount date').lean(),
     ]);
-    const latestByLoan = new Map(latestRepayments.map((r) => [String(r._id), r.date]));
     const pendingByLoan = groupBy(pendingEntries, (e) => String(e.loan));
-    const today = startOfToday();
 
     const data = loans
       .map((loan) => {
         const id = String(loan._id);
-        const { nextPaymentDate, isCollectedToday } = paymentSchedule(loan, latestByLoan.get(id), today);
         const pending = pendingByLoan.get(id) || [];
         return {
           _id: loan._id,
@@ -113,13 +103,13 @@ const getCollectableLoans = async (req, res) => {
           paymentFrequency: loan.paymentFrequency,
           installment: loan.expectedDailyMonthlyPayment,
           pendingAmount: loan.pendingAmount,
-          nextPaymentDate,
-          isCollectedToday,
+          // Where the loan stands against its installments: due today, overdue, paid ahead...
+          schedule: loanSchedule(loan, { today, paidToday: paidToday.get(id) || 0 }),
           // Entries for this loan still waiting for the admin
           awaitingApproval: {
             count: pending.length,
             amount: pending.reduce((sum, e) => sum + e.amount, 0),
-            today: pending.some((e) => sameDay(e.date, today)),
+            today: pending.some((e) => dayKey(e.date) === today),
           },
         };
       })

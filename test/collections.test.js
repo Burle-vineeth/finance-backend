@@ -19,8 +19,12 @@ describe('staff view of loans', () => {
     assert.equal(res.status, 200);
     const [loan] = res.body.data;
     assert.deepEqual(Object.keys(loan).sort(), [
-      '_id', 'awaitingApproval', 'client', 'installment', 'isCollectedToday', 'nextPaymentDate', 'paymentFrequency', 'pendingAmount',
+      '_id', 'awaitingApproval', 'client', 'installment', 'paymentFrequency', 'pendingAmount', 'schedule',
     ]);
+    // Seeded 5 days ago, daily over 10 days: installments from 4 days ago up to today are due, none paid
+    assert.equal(loan.schedule.status, 'OVERDUE');
+    assert.equal(loan.schedule.unpaidInstallments, 5);
+    assert.equal(loan.schedule.amountDue, 600);
     assert.equal(loan.client.name, 'Ramesh Kumar');
     assert.equal(loan.installment, 120);
     assert.equal(loan.pendingAmount, 1200);
@@ -285,16 +289,34 @@ describe('the admin\'s own entries still work as before', () => {
     assert.equal(loanAfter.profitRealized, 0);
   });
 
-  it('keeps the dashboard\'s next due date: one day after the latest repayment for a daily loan', async () => {
+  it('shows each loan against its installment schedule on the dashboard', async () => {
+    const { admin } = await seedTeam();
+    // Daily ₹120 over 10 days, disbursed 5 days ago: installments from 4 days ago to today (5) are due
+    const { loan } = await seedLoan();
+    await request(app).post('/api/transactions').set(auth(admin)).send({ type: 'REPAYMENT', loan: loan._id, amount: 240, date: today() });
+    const data = await dashboard(admin);
+    const [active] = data.collections.activeLoans;
+    assert.equal(active.schedule.status, 'OVERDUE');
+    assert.equal(active.schedule.amountDue, 360);
+    assert.equal(active.schedule.unpaidInstallments, 3);
+    assert.equal(active.schedule.paidToday, 240);
+    assert.equal(active.isCollectedToday, true);
+    // Today's own installment is due and not covered (the ₹240 paid the two oldest days)
+    assert.deepEqual(data.collections.dueToday, { amount: 120, count: 1, paidCount: 0 });
+    assert.deepEqual(data.collections.overdue, { amount: 240, loans: 1 });
+    assert.equal(data.collections.todayCollections, 240);
+  });
+
+  it('counts a payment as today\'s by the India date, not the server\'s UTC date', async () => {
     const { admin } = await seedTeam();
     const { loan } = await seedLoan();
-    const paidOn = new Date(Date.now() - 2 * 86400000).toISOString().substring(0, 10);
-    await request(app).post('/api/transactions').set(auth(admin)).send({ type: 'REPAYMENT', loan: loan._id, amount: 120, date: paidOn });
-    const [active] = (await dashboard(admin)).collections.activeLoans;
-    const expected = new Date(paidOn);
-    expected.setDate(expected.getDate() + 1);
-    assert.equal(new Date(active.nextPaymentDate).getTime(), expected.getTime());
-    assert.equal(active.isCollectedToday, false);
+    // Stored as the app stores a picked date: UTC midnight of that day
+    const yesterday = new Date(Date.now() - 86400000).toISOString().substring(0, 10);
+    await request(app).post('/api/transactions').set(auth(admin)).send({ type: 'REPAYMENT', loan: loan._id, amount: 120, date: yesterday });
+    const data = await dashboard(admin);
+    const { todayKey } = require('../src/services/schedule');
+    const isTodayInIndia = todayKey() === yesterday;
+    assert.equal(data.collections.todayCollections, isTodayInIndia ? 120 : 0);
   });
 
   it('still records capital, withdrawals and expenses', async () => {
