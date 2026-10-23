@@ -46,6 +46,7 @@ describe('loan schedule', () => {
     const s = loanSchedule(daily({ startDate: d('2026-10-20'), totalRepaid: 2400 }), { today: TODAY, paidToday: 1800 });
     assert.equal(s.status, 'PAID_AHEAD');
     assert.equal(s.paidUntil, '2026-10-24');
+    assert.equal(s.aheadAmount, 1200);
     assert.equal(s.nextDueDate, '2026-10-25');
     assert.equal(s.amountDue, 0);
     assert.equal(s.installmentTodayPaid, 600);
@@ -150,6 +151,39 @@ describe('loan schedule', () => {
     const s = loanSchedule(daily({ startDate: d('2026-10-01'), expectedReturnAmount: 60000, totalRepaid: 60000 }), { today: TODAY });
     assert.equal(s.status, 'PAID');
     assert.equal(s.amountDue, 0);
+  });
+
+  it('a set installment without a duration: as many installments as it takes, never "term ended"', () => {
+    // ₹10,000 at ₹600 a day: 16 installments of ₹600 and a last one of ₹400; first due 2 Oct, last 18 Oct
+    const loan = { paymentFrequency: 'DAILY', expectedReturnAmount: 10000, expectedDailyMonthlyPayment: 600, installmentIsCustom: true, startDate: d('2026-10-01'), totalRepaid: 6000, pendingAmount: 4000 };
+    const s = loanSchedule(loan, { today: TODAY });
+    assert.equal(s.installmentsTotal, 17);
+    assert.equal(s.lastDueDate, '2026-10-18');
+    assert.equal(s.hasTerm, false);
+    assert.equal(s.termEnded, false);
+    assert.equal(s.status, 'OVERDUE');
+    assert.equal(s.amountDue, 4000);
+    // The last installment is the ₹400 left over
+    const almost = loanSchedule({ ...loan, totalRepaid: 9600, pendingAmount: 400 }, { today: '2026-10-18' });
+    assert.equal(almost.status, 'DUE_TODAY');
+    assert.equal(almost.amountDue, 400);
+  });
+
+  it('a set installment with a duration: the installment decides, the duration gives the term', () => {
+    // ₹12,000 over 30 days at ₹500 a day: done in 24 installments, 2–25 Oct
+    const loan = { paymentFrequency: 'DAILY', durationDays: 30, expectedReturnAmount: 12000, expectedDailyMonthlyPayment: 500, installmentIsCustom: true, startDate: d('2026-10-01'), totalRepaid: 10500, pendingAmount: 1500 };
+    const s = loanSchedule(loan, { today: TODAY });
+    assert.equal(s.installmentsTotal, 24);
+    assert.equal(s.lastDueDate, '2026-10-25');
+    assert.equal(s.status, 'UP_TO_DATE');
+    const late = loanSchedule(loan, { today: '2026-10-28' });
+    assert.equal(late.status, 'OVERDUE');
+    assert.equal(late.termEnded, true);
+  });
+
+  it('a set installment that divides evenly has no extra paise installment', () => {
+    const loan = { paymentFrequency: 'MONTHLY', expectedReturnAmount: 1000, expectedDailyMonthlyPayment: 333.33, installmentIsCustom: true, startDate: d('2026-01-01'), totalRepaid: 0, pendingAmount: 1000 };
+    assert.equal(loanSchedule(loan, { today: '2026-01-15' }).installmentsTotal, 3);
   });
 
   it('counts installments the same way as the loan\'s installment amount', () => {

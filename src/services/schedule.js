@@ -56,6 +56,23 @@ const installmentCount = (frequency, durationDays) => {
   return count > 0 ? count : 1;
 };
 
+// The installment amount and how many installments repay the expected return. A loan whose installment was
+// set by hand (or that has no duration) needs as many as it takes at that amount, the last one smaller;
+// otherwise the duration decides how many, and the amount is the expected return split evenly.
+const installmentPlan = (loan) => {
+  const expected = loan.expectedReturnAmount;
+  const installment = loan.expectedDailyMonthlyPayment;
+  if ((loan.installmentIsCustom || !loan.durationDays) && installment > 0) {
+    const full = Math.floor((expected + EPSILON) / installment);
+    // What's left after the full installments is one more, smaller installment; under a rupee it is
+    // added to the last one instead (₹1,000 at ₹333.33 is 3 installments, not a 4th of 1 paisa)
+    const remainder = round2(expected - full * installment);
+    return { installment, total: Math.max(1, remainder >= 1 ? full + 1 : full) };
+  }
+  const total = installmentCount(loan.paymentFrequency, loan.durationDays);
+  return { installment: installment || round2(expected / total), total };
+};
+
 const addPeriods = (frequency, key, periods) => {
   if (frequency === 'WEEKLY') return addDays(key, 7 * periods);
   if (frequency === 'MONTHLY') return addMonths(key, periods);
@@ -76,10 +93,11 @@ const addPeriods = (frequency, key, periods) => {
 //   PAID          nothing left to pay
 const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
   const frequency = loan.paymentFrequency;
-  const total = installmentCount(frequency, loan.durationDays);
+  const { installment, total } = installmentPlan(loan);
   const expected = loan.expectedReturnAmount;
-  const installment = loan.expectedDailyMonthlyPayment || round2(expected / total);
   const paid = loan.totalRepaid || 0;
+  // Only a loan with an agreed duration has a term that can end; one without just runs until repaid
+  const hasTerm = Boolean(loan.durationDays);
 
   // Installment i falls i periods after the collection start date, or i + 1 periods after disbursement.
   // Counting each from that anchor keeps monthly dates on the anchor's day (31 Jan → 28 Feb → 31 Mar).
@@ -147,8 +165,10 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
     installmentsDue,
     installmentsPaid,
     firstDueDate,
+    // The last installment's date: the end of the term, or when a loan without a duration should be repaid
     lastDueDate,
-    termEnded: today > lastDueDate,
+    hasTerm,
+    termEnded: hasTerm && today > lastDueDate,
     // The oldest unpaid installment (in the past when overdue)
     nextDueDate,
     overdueSince: status === 'OVERDUE' ? nextDueDate : null,
@@ -157,6 +177,8 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
     dueSoFar,
     // What brings the loan up to date today, today's installment included
     amountDue,
+    // Paid beyond what is due so far (the client is ahead by this much)
+    aheadAmount: round2(Math.max(0, paid - dueSoFar)),
     // Unpaid installments from before today, without today's
     overdueBeforeToday,
     unpaidInstallments,
@@ -173,5 +195,6 @@ module.exports = {
   addDays,
   keyToDate,
   installmentCount,
+  installmentPlan,
   loanSchedule,
 };

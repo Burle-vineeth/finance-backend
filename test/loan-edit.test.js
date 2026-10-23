@@ -109,7 +109,7 @@ describe('correcting a loan\'s details', () => {
 
   it('refuses changes to amounts and terms, and bad input', async () => {
     const { admin, loan } = await seedWithHistory();
-    for (const body of [{ principalAmount: 5000 }, { expectedReturnAmount: 9000 }, { durationDays: 20 }, { paymentFrequency: 'WEEKLY' }, { status: 'CLOSED' }]) {
+    for (const body of [{ principalAmount: 5000 }, { expectedReturnAmount: 9000 }, { paymentFrequency: 'WEEKLY' }, { status: 'CLOSED' }]) {
       const res = await patch(admin, loan._id, body);
       assert.equal(res.status, 400, JSON.stringify(body));
     }
@@ -120,6 +120,115 @@ describe('correcting a loan\'s details', () => {
     const unchanged = await models.Loan.findById(loan._id).lean();
     assert.equal(unchanged.principalAmount, 1000);
     assert.equal(unchanged.paymentFrequency, 'DAILY');
+  });
+
+  it('changes the installment, and the schedule follows', async () => {
+    // Seeded: ₹1,200 over 10 days, so ₹120 a day worked out from the duration
+    const { admin, loan } = await seedWithHistory();
+    const res = await patch(admin, loan._id, { installment: 150 });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.data.changes, [{ field: 'installment', from: '₹120', to: '₹150' }]);
+    assert.equal(res.body.data.schedule.before.installmentsTotal, 10);
+    assert.equal(res.body.data.schedule.after.installmentsTotal, 8);
+    const updated = await models.Loan.findById(loan._id).lean();
+    assert.equal(updated.expectedDailyMonthlyPayment, 150);
+    assert.equal(updated.installmentIsCustom, true);
+    // Amounts stay as they were
+    assert.equal(updated.expectedReturnAmount, 1200);
+    assert.equal(updated.pendingAmount, 960);
+  });
+
+  it('refuses an installment too small for the duration, or bigger than the expected return', async () => {
+    const { admin, loan } = await seedWithHistory();
+    const small = await patch(admin, loan._id, { installment: 100 });
+    assert.equal(small.status, 400);
+    assert.match(small.body.error, /at least ₹120/);
+    assert.equal((await patch(admin, loan._id, { installment: 5000 })).status, 400);
+    assert.equal((await patch(admin, loan._id, { installment: 0 })).status, 400);
+    assert.equal((await models.Loan.findById(loan._id).lean()).expectedDailyMonthlyPayment, 120);
+  });
+
+  it('a blank installment goes back to working it out from the duration', async () => {
+    const { admin, loan } = await seedWithHistory();
+    await patch(admin, loan._id, { installment: 150 });
+    const res = await patch(admin, loan._id, { installment: '' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.data.changes, [{ field: 'installment', from: '₹150', to: '₹120 (from the duration)' }]);
+    const updated = await models.Loan.findById(loan._id).lean();
+    assert.equal(updated.expectedDailyMonthlyPayment, 120);
+    assert.equal(updated.installmentIsCustom, false);
+  });
+
+  it('a loan without a duration keeps needing an installment', async () => {
+    const { admin } = await seedTeam();
+    await models.Transaction.create({ type: 'CAPITAL_INJECTION', amount: 100000 });
+    const client = await models.Client.create({ name: 'Anitha Rao', phone: '9652311223' });
+    const created = await request(app).post('/api/loans').set(auth(admin)).send({
+      client: String(client._id), principalAmount: 10000, expectedReturnAmount: 12000, paymentFrequency: 'DAILY', installment: 500, startDate: today(),
+    });
+    assert.equal(created.status, 201);
+    const id = created.body.data._id;
+    assert.equal((await patch(admin, id, { installment: '' })).status, 400);
+    const lower = await patch(admin, id, { installment: 300 });
+    assert.equal(lower.status, 200);
+    assert.equal(lower.body.data.schedule.after.installmentsTotal, 40);
+    assert.equal(lower.body.data.schedule.after.hasTerm, false);
+  });
+
+  it('the same installment again is no change', async () => {
+    const { admin, loan } = await seedWithHistory();
+    const res = await patch(admin, loan._id, { installment: '120' });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.data.saved, false);
+    assert.equal((await models.Loan.findById(loan._id).lean()).installmentIsCustom, false);
+  });
+
+  it('a new tenure re-works a worked-out installment', async () => {
+    // ₹1,200 over 10 days (₹120) becomes 20 days (₹60)
+    const { admin, loan } = await seedWithHistory();
+    const res = await patch(admin, loan._id, { durationDays: 20 });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.data.changes, [
+      { field: 'durationDays', from: '10 days', to: '20 days' },
+      { field: 'installment', from: '₹120', to: '₹60 (from the duration)' },
+    ]);
+    const updated = await models.Loan.findById(loan._id).lean();
+    assert.equal(updated.durationDays, 20);
+    assert.equal(updated.expectedDailyMonthlyPayment, 60);
+    assert.equal(updated.installmentIsCustom, false);
+  });
+
+  it('a hand-set installment stays with a new tenure, and must fit it', async () => {
+    const { admin, loan } = await seedWithHistory();
+    await patch(admin, loan._id, { installment: 200 });
+    assert.equal((await patch(admin, loan._id, { durationDays: 5 })).status, 400);
+    const res = await patch(admin, loan._id, { durationDays: 6 });
+    assert.equal(res.status, 200);
+    const updated = await models.Loan.findById(loan._id).lean();
+    assert.equal(updated.durationDays, 6);
+    assert.equal(updated.expectedDailyMonthlyPayment, 200);
+  });
+
+  it('clearing the tenure keeps the installment and runs until repaid', async () => {
+    const { admin, loan } = await seedWithHistory();
+    const res = await patch(admin, loan._id, { durationDays: '' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.data.changes, [{ field: 'durationDays', from: '10 days', to: 'until repaid' }]);
+    assert.equal(res.body.data.schedule.after.hasTerm, false);
+    const updated = await models.Loan.findById(loan._id).lean();
+    assert.equal(updated.durationDays, undefined);
+    assert.equal(updated.expectedDailyMonthlyPayment, 120);
+    assert.equal(updated.installmentIsCustom, true);
+    // Without a tenure, a blank installment can't be worked out
+    assert.equal((await patch(admin, loan._id, { installment: '' })).status, 400);
+  });
+
+  it('refuses a bad tenure', async () => {
+    const { admin, loan } = await seedWithHistory();
+    for (const value of [0, -3, 2.5, 'abc']) {
+      assert.equal((await patch(admin, loan._id, { durationDays: value })).status, 400, String(value));
+    }
+    assert.equal((await models.Loan.findById(loan._id).lean()).durationDays, 10);
   });
 
   it('is for the admin only', async () => {
