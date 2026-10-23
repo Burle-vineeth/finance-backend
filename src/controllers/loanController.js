@@ -4,6 +4,7 @@ const Client = require('../models/Client');
 const Transaction = require('../models/Transaction');
 const CollectionEntry = require('../models/CollectionEntry');
 const { loanSchedule, todayKey, dayKey, installmentCount } = require('../services/schedule');
+const { parseCustomInstallments, planProblems, samePlan, planSummary } = require('../services/customInstallments');
 const { repaidOnDayByLoan } = require('../services/repayments');
 const { withTransaction } = require('../utils/withTransaction');
 const { HttpError, sendError } = require('../utils/httpError');
@@ -49,8 +50,31 @@ const installmentTerms = ({ installment, durationDays, expectedReturnAmount, pay
   };
 };
 
-// The details of a loan that can be corrected after it is created; its amounts and terms can't
-const EDITABLE_FIELDS = ['client', 'startDate', 'collectionStartDate', 'durationDays', 'installment'];
+// A loan on a custom installment plan takes its dates and amounts from the plan, so it can't also have these
+const NOT_WITH_A_PLAN = 'A loan on a custom installment plan has no duration, fixed installment or collection start date: '
+  + 'the plan sets its dates and amounts';
+
+// The repayment terms of a new loan: a custom installment plan, or an installment and/or a duration (see installmentTerms)
+const loanTerms = (body) => {
+  const { customInstallments, installment, durationDays, collectionStartDate, expectedReturnAmount, paymentFrequency, startDate } = body;
+  if (customInstallments === undefined || customInstallments === null) {
+    return { ...installmentTerms({ installment, durationDays, expectedReturnAmount, paymentFrequency }), collectionStartDate };
+  }
+  if (!isBlank(installment) || !isBlank(durationDays) || !isBlank(collectionStartDate)) throw new HttpError(400, NOT_WITH_A_PLAN);
+  const expected = Number(expectedReturnAmount);
+  if (!(Number.isFinite(expected) && expected > 0)) throw new HttpError(400, 'Enter the expected return before the installments');
+  return { customInstallments: parseCustomInstallments(customInstallments, { expected, startDate: startDate ? new Date(startDate) : new Date() }) };
+};
+
+// How a loan repays, for its edit history: "10 installments of ₹1,200, ..." or "₹600 per day for 100 days"
+const termsText = ({ customInstallments, expectedDailyMonthlyPayment, durationDays, paymentFrequency }) => {
+  if (customInstallments?.length) return planSummary(customInstallments);
+  const per = `${rupees(expectedDailyMonthlyPayment)} per ${PERIOD_NAMES[paymentFrequency] || 'installment'}`;
+  return durationDays ? `${per} for ${durationDays} days` : `${per}, until repaid`;
+};
+
+// The details of a loan that can be corrected after it is created; its amounts can't
+const EDITABLE_FIELDS = ['client', 'startDate', 'collectionStartDate', 'durationDays', 'installment', 'customInstallments'];
 
 // A picked day, 'YYYY-MM-DD', stored as UTC midnight of that day like the dates of new loans
 const parseDay = (value, label) => {
@@ -85,8 +109,8 @@ const getLoans = async (req, res) => {
 // @access  Public
 const addLoan = async (req, res) => {
   try {
-    const { client, principalAmount, expectedReturnAmount, paymentFrequency, durationDays, installment, startDate, collectionStartDate } = req.body;
-    const terms = installmentTerms({ installment, durationDays, expectedReturnAmount, paymentFrequency });
+    const { client, principalAmount, expectedReturnAmount, paymentFrequency, startDate } = req.body;
+    const { collectionStartDate, ...terms } = loanTerms(req.body);
 
     // Calculate cash on hand
     const cashStats = await Transaction.aggregate([
@@ -149,7 +173,8 @@ const addLoan = async (req, res) => {
   }
 };
 
-// @desc    Correct a loan's client, disbursement date, collection start date or installment. The loan's own records
+// @desc    Correct a loan's client, disbursement date, collection start date, tenure, installment or custom installment
+//          plan (customInstallments: a list to set or replace it, null to go back to a tenure and installment). The loan's own records
 //          move with it (its disbursement entry, and the repayments and staff entries naming the old client),
 //          all in one transaction, and the change is added to the loan's edit history.
 //          With dryRun: true nothing is saved; the response shows the changes and the schedule before and after.
@@ -161,7 +186,7 @@ const updateLoanDetails = async (req, res) => {
     const body = req.body || {};
     const notEditable = Object.keys(body).filter((key) => !EDITABLE_FIELDS.includes(key) && key !== 'dryRun');
     if (notEditable.length) {
-      throw new HttpError(400, `Only the client, disbursement date, collection start date, tenure and installment can be changed (not ${notEditable.join(', ')})`);
+      throw new HttpError(400, `Only the client, disbursement date, collection start date, tenure, installment and installment plan can be changed (not ${notEditable.join(', ')})`);
     }
 
     const result = await withTransaction(async (session) => {
@@ -202,6 +227,25 @@ const updateLoanDetails = async (req, res) => {
       }
 
       const start = newStart || loan.startDate;
+      const expected = loan.expectedReturnAmount;
+
+      // The custom installment plan after the edit, or null for none. Its dates must stay on or after the disbursement date.
+      const hadPlan = Boolean(loan.customInstallments?.length);
+      let plan = hadPlan ? loan.customInstallments.map((row) => ({ date: row.date, amount: row.amount })) : null;
+      if (body.customInstallments !== undefined) {
+        plan = body.customInstallments === null ? null : parseCustomInstallments(body.customInstallments, { expected, startDate: start });
+      } else if (plan && newStart) {
+        const [problem] = planProblems(plan, { expected, startDate: start });
+        if (problem) throw new HttpError(400, `${problem}. Move that installment, or change the plan along with the date`);
+      }
+      if (plan && (!isBlank(body.durationDays) || !isBlank(body.installment))) throw new HttpError(400, NOT_WITH_A_PLAN);
+      if (plan && newCollection) throw new HttpError(400, NOT_WITH_A_PLAN);
+      // Moving to a plan drops the collection start date: the plan's first installment is when collection starts
+      if (plan && loan.collectionStartDate && newCollection === undefined) {
+        newCollection = null;
+        changes.push({ field: 'collectionStartDate', from: dayKey(loan.collectionStartDate), to: '' });
+      }
+
       const collection = newCollection === undefined ? loan.collectionStartDate : newCollection;
       if (collection && dayKey(collection) < dayKey(start)) {
         throw new HttpError(400, 'Collection can\'t start before the loan is disbursed');
@@ -210,8 +254,8 @@ const updateLoanDetails = async (req, res) => {
       // Tenure and installment, worked out together. Tenure: a number of days, or blank for "until repaid".
       // Installment: an amount sets it by hand; blank works it out from the tenure. Without an installment in the
       // request, a worked-out one follows the new tenure and a hand-set one stays (it must still fit the tenure).
-      const expected = loan.expectedReturnAmount;
-      let days = loan.durationDays || undefined;
+      // Leaving a plan, they come from the request alone: a hand-set installment, or one worked out from the tenure.
+      let days = plan || hadPlan ? undefined : loan.durationDays || undefined;
       if (body.durationDays !== undefined) {
         if (isBlank(body.durationDays)) {
           days = undefined;
@@ -223,10 +267,17 @@ const updateLoanDetails = async (req, res) => {
       let amount = loan.expectedDailyMonthlyPayment;
       let custom = Boolean(loan.installmentIsCustom);
       const fromTenure = () => {
-        if (!days) throw new HttpError(400, 'A loan without a duration needs an installment');
+        if (!days) throw new HttpError(400, hadPlan ? 'Without the installment plan, set a duration, an installment or both' : 'A loan without a duration needs an installment');
         return Math.round((expected / installmentCount(loan.paymentFrequency, days)) * 100) / 100;
       };
-      if (body.installment !== undefined && isBlank(body.installment)) {
+      if (plan) {
+        // The plan sets the dates and amounts; the installment is its average (see the Loan model)
+        amount = Math.round((expected / plan.length) * 100) / 100;
+        custom = true;
+      } else if (hadPlan && isBlank(body.installment)) {
+        amount = fromTenure();
+        custom = false;
+      } else if (body.installment !== undefined && isBlank(body.installment)) {
         amount = fromTenure();
         custom = false;
       } else if (body.installment !== undefined) {
@@ -238,22 +289,36 @@ const updateLoanDetails = async (req, res) => {
         // A worked-out installment follows the tenure; with no tenure left it stays as it is, now set by hand
         if (days) amount = fromTenure(); else custom = true;
       }
-      if (custom) checkInstallment(amount, { expected, days, frequency: loan.paymentFrequency });
+      if (custom && !plan) checkInstallment(amount, { expected, days, frequency: loan.paymentFrequency });
 
-      const tenureText = (value) => (value ? `${value} days` : 'until repaid');
       const tenureChanged = (days || null) !== (loan.durationDays || null);
-      if (tenureChanged) changes.push({ field: 'durationDays', from: tenureText(loan.durationDays), to: tenureText(days) });
       const installmentChanged = Math.abs(amount - loan.expectedDailyMonthlyPayment) >= 0.005;
-      if (installmentChanged) {
-        changes.push({
-          field: 'installment',
-          from: rupees(loan.expectedDailyMonthlyPayment),
-          to: custom ? rupees(amount) : `${rupees(amount)} (from the duration)`,
-        });
+      const planChanged = Boolean(plan) !== hadPlan || (plan && !samePlan(plan, loan.customInstallments));
+      if (plan || hadPlan) {
+        // Onto, off or within a plan: one entry for how the loan repays, before and after
+        if (planChanged) {
+          const after = { customInstallments: plan, expectedDailyMonthlyPayment: amount, durationDays: days, paymentFrequency: loan.paymentFrequency };
+          const from = termsText(loan);
+          let to = termsText(after);
+          // Moved or reshuffled installments can read the same in summary
+          if (from === to) to += ' (dates or amounts changed)';
+          if (!plan) to += custom ? '' : ' (from the duration)';
+          changes.push({ field: 'customInstallments', from, to });
+        }
+      } else {
+        const tenureText = (value) => (value ? `${value} days` : 'until repaid');
+        if (tenureChanged) changes.push({ field: 'durationDays', from: tenureText(loan.durationDays), to: tenureText(days) });
+        if (installmentChanged) {
+          changes.push({
+            field: 'installment',
+            from: rupees(loan.expectedDailyMonthlyPayment),
+            to: custom ? rupees(amount) : `${rupees(amount)} (from the duration)`,
+          });
+        }
       }
-      const termsChanged = tenureChanged || installmentChanged || custom !== Boolean(loan.installmentIsCustom);
+      const termsChanged = planChanged || tenureChanged || installmentChanged || custom !== Boolean(loan.installmentIsCustom);
       const installmentFields = termsChanged
-        ? { durationDays: days, expectedDailyMonthlyPayment: amount, installmentIsCustom: custom }
+        ? { customInstallments: plan || undefined, durationDays: days, expectedDailyMonthlyPayment: amount, installmentIsCustom: custom }
         : {};
 
       // The schedule before and after, for the review step in the app
