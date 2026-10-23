@@ -79,7 +79,7 @@ const addWarnings = async (entries) => {
 const getCollectableLoans = async (req, res) => {
   try {
     const loans = await Loan.find({ status: 'ACTIVE' })
-      .select('client paymentFrequency durationDays expectedReturnAmount expectedDailyMonthlyPayment totalRepaid pendingAmount startDate collectionStartDate')
+      .select('client paymentFrequency durationDays expectedReturnAmount expectedDailyMonthlyPayment installmentIsCustom customInstallments totalRepaid pendingAmount startDate collectionStartDate')
       .populate('client', 'name phone address')
       .lean();
     const loanIds = loans.map((loan) => loan._id);
@@ -95,16 +95,18 @@ const getCollectableLoans = async (req, res) => {
       .map((loan) => {
         const id = String(loan._id);
         const pending = pendingByLoan.get(id) || [];
+        const schedule = loanSchedule(loan, { today, paidToday: paidToday.get(id) || 0 });
         return {
           _id: loan._id,
           client: loan.client
             ? { name: loan.client.name, phone: loan.client.phone, address: loan.client.address }
             : null,
           paymentFrequency: loan.paymentFrequency,
-          installment: loan.expectedDailyMonthlyPayment,
+          // The installment to expect (on a custom plan, the next unpaid one, as plan amounts can differ)
+          installment: schedule.installment,
           pendingAmount: loan.pendingAmount,
           // Where the loan stands against its installments: due today, overdue, paid ahead...
-          schedule: loanSchedule(loan, { today, paidToday: paidToday.get(id) || 0 }),
+          schedule,
           // Entries for this loan still waiting for the admin
           awaitingApproval: {
             count: pending.length,
@@ -184,7 +186,7 @@ const listCollections = async (req, res) => {
 
     const entries = await CollectionEntry.find(filter)
       .populate('client', 'name')
-      .populate('loan', 'status pendingAmount expectedDailyMonthlyPayment paymentFrequency')
+      .populate('loan', 'status pendingAmount expectedDailyMonthlyPayment paymentFrequency customInstallments')
       .populate('submittedBy', 'name')
       .populate('reviewedBy', 'name')
       .sort(status === 'PENDING' ? { date: 1, createdAt: 1 } : { createdAt: -1 })
@@ -192,6 +194,13 @@ const listCollections = async (req, res) => {
       .lean();
 
     if (req.user.role === 'ADMIN' && status === 'PENDING') await addWarnings(entries);
+    // Whether the loan is on a custom installment plan is enough here; the plan itself stays on the loan
+    // (a copy per entry: entries for the same loan can share one populated object)
+    for (const entry of entries) {
+      if (!entry.loan) continue;
+      const { customInstallments, ...loan } = entry.loan;
+      entry.loan = { ...loan, customPlan: Boolean(customInstallments?.length) };
+    }
     res.json({ success: true, data: entries });
   } catch (error) {
     sendError(res, error, 'List Collections Error:');

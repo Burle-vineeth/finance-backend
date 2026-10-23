@@ -79,7 +79,79 @@ const addPeriods = (frequency, key, periods) => {
   return addDays(key, periods);
 };
 
-// Where a loan stands today.
+// How a loan's installments fall: their dates and the money due as they come in.
+//   dueOn(i)                 date of installment i ('YYYY-MM-DD')
+//   dueAmount(count)         money due once `count` installments have fallen due
+//   installmentsDueBy(day)   installments due on or before a day
+//   installmentsPaidBy(paid) installments fully covered by `paid`, oldest first
+const regularTimeline = (loan) => {
+  const frequency = loan.paymentFrequency;
+  const { installment, total } = installmentPlan(loan);
+  const expected = loan.expectedReturnAmount;
+
+  // Installment i falls i periods after the collection start date, or i + 1 periods after disbursement.
+  // Counting each from that anchor keeps monthly dates on the anchor's day (31 Jan → 28 Feb → 31 Mar).
+  const anchor = loan.collectionStartDate ? dayKey(loan.collectionStartDate) : dayKey(loan.startDate);
+  const offset = loan.collectionStartDate ? 0 : 1;
+  const dueOn = (index) => addPeriods(frequency, anchor, index + offset);
+  const firstDueDate = dueOn(0);
+
+  return {
+    total,
+    installment,
+    customPlan: false,
+    // Only a loan with an agreed duration has a term that can end; one without just runs until repaid
+    hasTerm: Boolean(loan.durationDays),
+    dueOn,
+    // The last installment makes up the rounding
+    dueAmount: (count) => (count >= total ? expected : round2(Math.min(count * installment, expected))),
+    installmentsDueBy: (day) => {
+      if (day < firstDueDate) return 0;
+      if (frequency === 'DAILY') return Math.min(total, daysBetween(firstDueDate, day) + 1);
+      if (frequency === 'WEEKLY') return Math.min(total, Math.floor(daysBetween(firstDueDate, day) / 7) + 1);
+      let count = 0;
+      while (count < total && dueOn(count) <= day) count++;
+      return count;
+    },
+    installmentsPaidBy: (paid) => (paid + EPSILON >= expected
+      ? total
+      : Math.min(total - 1, Math.floor((paid + EPSILON) / installment))),
+  };
+};
+
+// A custom installment plan: the dates and amounts were set one by one (see services/customInstallments)
+const planTimeline = (loan) => {
+  const rows = loan.customInstallments
+    .map((row) => ({ date: dayKey(row.date), amount: row.amount }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const total = rows.length;
+  const expected = loan.expectedReturnAmount;
+  const cumulative = [0];
+  rows.forEach((row) => cumulative.push(round2(cumulative[cumulative.length - 1] + row.amount)));
+
+  return {
+    total,
+    installment: null,
+    customPlan: true,
+    // A plan ends with its last installment
+    hasTerm: true,
+    dueOn: (index) => rows[index].date,
+    dueAmount: (count) => (count >= total ? expected : cumulative[count]),
+    installmentsDueBy: (day) => {
+      let count = 0;
+      while (count < total && rows[count].date <= day) count++;
+      return count;
+    },
+    installmentsPaidBy: (paid) => {
+      if (paid + EPSILON >= expected) return total;
+      let count = 0;
+      while (count < total - 1 && cumulative[count + 1] <= paid + EPSILON) count++;
+      return count;
+    },
+  };
+};
+
+// Where a loan stands today, against its regular schedule or its custom installment plan.
 //   today      'YYYY-MM-DD' in India (defaults to now)
 //   paidToday  what was repaid on this loan today, for "collected today"
 //
@@ -92,45 +164,25 @@ const addPeriods = (frequency, key, periods) => {
 //   OVERDUE       an installment from before today is unpaid (or the term has ended with money owed)
 //   PAID          nothing left to pay
 const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
-  const frequency = loan.paymentFrequency;
-  const { installment, total } = installmentPlan(loan);
+  const timeline = loan.customInstallments?.length ? planTimeline(loan) : regularTimeline(loan);
+  const { total, hasTerm, dueOn, dueAmount, installmentsDueBy } = timeline;
   const expected = loan.expectedReturnAmount;
   const paid = loan.totalRepaid || 0;
-  // Only a loan with an agreed duration has a term that can end; one without just runs until repaid
-  const hasTerm = Boolean(loan.durationDays);
-
-  // Installment i falls i periods after the collection start date, or i + 1 periods after disbursement.
-  // Counting each from that anchor keeps monthly dates on the anchor's day (31 Jan → 28 Feb → 31 Mar).
-  const anchor = loan.collectionStartDate ? dayKey(loan.collectionStartDate) : dayKey(loan.startDate);
-  const offset = loan.collectionStartDate ? 0 : 1;
-  const dueOn = (index) => addPeriods(frequency, anchor, index + offset);
   const firstDueDate = dueOn(0);
   const lastDueDate = dueOn(total - 1);
 
-  // Money due once `count` installments have fallen due; the last one makes up the rounding
-  const dueAmount = (count) => (count >= total ? expected : round2(Math.min(count * installment, expected)));
-
-  // Installments due on or before a day
-  const installmentsDueBy = (day) => {
-    if (day < firstDueDate) return 0;
-    if (frequency === 'DAILY') return Math.min(total, daysBetween(firstDueDate, day) + 1);
-    if (frequency === 'WEEKLY') return Math.min(total, Math.floor(daysBetween(firstDueDate, day) / 7) + 1);
-    let count = 0;
-    while (count < total && dueOn(count) <= day) count++;
-    return count;
-  };
-
-  // Installments fully covered by what has been paid, oldest first
-  const installmentsPaid = paid + EPSILON >= expected
-    ? total
-    : Math.min(total - 1, Math.floor((paid + EPSILON) / installment));
-
+  const installmentsPaid = timeline.installmentsPaidBy(paid);
   const installmentsDue = installmentsDueBy(today);
   const dueSoFar = dueAmount(installmentsDue);
   const amountDue = round2(Math.max(0, dueSoFar - paid));
   const overdueBeforeToday = round2(Math.max(0, dueAmount(installmentsDueBy(addDays(today, -1))) - paid));
   const nextDueDate = installmentsPaid < total ? dueOn(installmentsPaid) : null;
   const unpaidInstallments = Math.max(0, installmentsDue - installmentsPaid);
+  // The next unpaid installment in full (for a plan, each can differ)
+  const nextInstallmentAmount = installmentsPaid < total
+    ? round2(dueAmount(installmentsPaid + 1) - dueAmount(installmentsPaid))
+    : 0;
+  const installment = timeline.installment ?? nextInstallmentAmount;
 
   // Today's own installment, if one falls today, and how much of it is paid (by any payment, early ones included)
   const installmentToday = installmentsDue > 0 && dueOn(installmentsDue - 1) === today
@@ -161,6 +213,9 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
     status,
     today,
     installment,
+    // True when the loan follows a custom installment plan (dates and amounts set one by one)
+    customPlan: timeline.customPlan,
+    nextInstallmentAmount,
     installmentsTotal: total,
     installmentsDue,
     installmentsPaid,

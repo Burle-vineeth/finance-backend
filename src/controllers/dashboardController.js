@@ -96,7 +96,7 @@ const getDashboardMetrics = async (req, res) => {
         loanId: loan._id,
         clientName: loan.client?.name || 'Unknown',
         frequency: loan.paymentFrequency,
-        expectedPayment: loan.expectedDailyMonthlyPayment,
+        expectedPayment: schedule.installment,
         pendingAmount: loan.pendingAmount,
         // For app versions from before the schedule: the oldest unpaid installment, and whether anything was paid today
         nextPaymentDate: keyToDate(schedule.nextDueDate || schedule.lastDueDate),

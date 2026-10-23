@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { installmentCount } = require('../services/schedule');
+const { planProblems } = require('../services/customInstallments');
 
 const loanSchema = new mongoose.Schema(
   {
@@ -40,6 +41,13 @@ const loanSchema = new mongoose.Schema(
     installmentIsCustom: {
       type: Boolean,
       default: false,
+    },
+    // A custom installment plan: each installment's date and amount, set one by one (see services/customInstallments).
+    // With one, the plan is the schedule: the loan has no duration or collection start date, and the installment
+    // above is just the plan's average. Left unset (not an empty list) for loans without one.
+    customInstallments: {
+      type: [{ _id: false, date: { type: Date, required: true }, amount: { type: Number, required: true } }],
+      default: undefined,
     },
     status: {
       type: String,
@@ -96,8 +104,18 @@ loanSchema.pre('validate', function() {
     }
   }
 
-  // Calculate expected payment based on frequency, unless the installment was set by hand
-  if (!this.installmentIsCustom) {
+  if (this.customInstallments?.length) {
+    // The plan must stay good: its dates on or after the disbursement date, its amounts adding up to the expected return
+    const problems = planProblems(this.customInstallments, { expected: this.expectedReturnAmount, startDate: this.startDate });
+    if (problems.length) this.invalidate('customInstallments', problems[0]);
+    if (this.durationDays) this.invalidate('durationDays', 'A loan on a custom installment plan has no duration');
+    if (this.collectionStartDate) this.invalidate('collectionStartDate', 'A loan on a custom installment plan has no collection start date');
+    if (this.isModified('customInstallments')) {
+      this.installmentIsCustom = true;
+      this.expectedDailyMonthlyPayment = parseFloat((this.expectedReturnAmount / this.customInstallments.length).toFixed(2));
+    }
+  } else if (!this.installmentIsCustom) {
+    // Calculate expected payment based on frequency, unless the installment was set by hand
     if (!this.durationDays) {
       this.invalidate('durationDays', 'Set an installment or a duration');
     } else if (this.isModified('expectedReturnAmount') || this.isModified('durationDays') || this.isModified('paymentFrequency')) {
