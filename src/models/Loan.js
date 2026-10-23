@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { installmentCount } = require('../services/schedule');
 
 const loanSchema = new mongoose.Schema(
   {
@@ -25,13 +26,20 @@ const loanSchema = new mongoose.Schema(
       enum: ['DAILY', 'WEEKLY', 'MONTHLY'],
       required: true,
     },
+    // Optional: a loan without a duration runs until it is repaid
     durationDays: {
       type: Number,
-      required: true, // E.g., 30 days
+      min: [1, 'Duration must be at least 1 day'],
     },
+    // The installment: set by hand (installmentIsCustom), or worked out as expectedReturnAmount / installments in the duration
     expectedDailyMonthlyPayment: {
       type: Number,
-      required: true, // e.g., expectedReturnAmount / (durationDays / frequency)
+      required: true,
+      min: [0.01, 'Installment must be greater than zero'],
+    },
+    installmentIsCustom: {
+      type: Boolean,
+      default: false,
     },
     status: {
       type: String,
@@ -65,6 +73,14 @@ const loanSchema = new mongoose.Schema(
     resolvedAt: {
       type: Date,
     },
+    // Corrections made after the loan was created: what changed, from what to what, when and by whom
+    editHistory: [{
+      _id: false,
+      at: { type: Date, default: Date.now },
+      by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      byName: { type: String },
+      changes: [{ _id: false, field: String, from: String, to: String }],
+    }],
   },
   {
     timestamps: true,
@@ -80,21 +96,15 @@ loanSchema.pre('validate', function() {
     }
   }
 
-  // Calculate expected payment based on frequency
-  if (this.isModified('expectedReturnAmount') || this.isModified('durationDays') || this.isModified('paymentFrequency')) {
-    let numberOfPayments = 1;
-    if (this.paymentFrequency === 'DAILY') {
-      numberOfPayments = this.durationDays;
-    } else if (this.paymentFrequency === 'WEEKLY') {
-      numberOfPayments = Math.ceil(this.durationDays / 7);
-    } else if (this.paymentFrequency === 'MONTHLY') {
-      numberOfPayments = Math.ceil(this.durationDays / 30);
+  // Calculate expected payment based on frequency, unless the installment was set by hand
+  if (!this.installmentIsCustom) {
+    if (!this.durationDays) {
+      this.invalidate('durationDays', 'Set an installment or a duration');
+    } else if (this.isModified('expectedReturnAmount') || this.isModified('durationDays') || this.isModified('paymentFrequency')) {
+      // The same count the payment schedule uses (at least 1, to avoid dividing by zero)
+      const numberOfPayments = installmentCount(this.paymentFrequency, this.durationDays);
+      this.expectedDailyMonthlyPayment = parseFloat((this.expectedReturnAmount / numberOfPayments).toFixed(2));
     }
-    
-    // Default to at least 1 to avoid infinity
-    numberOfPayments = numberOfPayments > 0 ? numberOfPayments : 1; 
-    
-    this.expectedDailyMonthlyPayment = parseFloat((this.expectedReturnAmount / numberOfPayments).toFixed(2));
   }
 });
 

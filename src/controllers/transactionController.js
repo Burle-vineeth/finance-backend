@@ -1,9 +1,13 @@
 const Transaction = require('../models/Transaction');
 const Loan = require('../models/Loan');
+const CollectionEntry = require('../models/CollectionEntry');
+const { applyRepayment } = require('../services/repayments');
+const { withTransaction } = require('../utils/withTransaction');
+const { HttpError, sendError } = require('../utils/httpError');
 
 // @desc    Get all transactions (Ledger)
 // @route   GET /api/transactions
-// @access  Public
+// @access  Admin
 const getTransactions = async (req, res) => {
   try {
     // The app only shows the client's name and groups by loan id, so populate just those
@@ -11,6 +15,7 @@ const getTransactions = async (req, res) => {
     const transactions = await Transaction.find()
       .populate('client', 'name')
       .populate('loan', '_id')
+      .populate('collectedBy', 'name')
       .sort({ date: -1, createdAt: -1 })
       .lean();
     res.status(200).json({ success: true, data: transactions });
@@ -21,57 +26,20 @@ const getTransactions = async (req, res) => {
 
 // @desc    Log a new transaction (Repayment, Capital Injection, etc)
 // @route   POST /api/transactions
-// @access  Public
+// @access  Admin
 const addTransaction = async (req, res) => {
   try {
     const { type, amount, client, loan, notes, date } = req.body;
 
-    let principalPortion = 0;
-    let profitPortion = 0;
-
-    // --- SMART SPLIT LOGIC FOR REPAYMENTS ---
     if (type === 'REPAYMENT') {
       if (!loan) {
         return res.status(400).json({ success: false, error: 'Loan ID is required for a repayment' });
       }
-
-      const activeLoan = await Loan.findById(loan);
-      if (!activeLoan) {
-        return res.status(404).json({ success: false, error: 'Loan not found' });
-      }
-
-      // --- PRINCIPAL FIRST RECOVERY LOGIC ---
-      const remainingPrincipalToRecover = activeLoan.principalAmount - (activeLoan.principalRecovered || 0);
-
-      if (remainingPrincipalToRecover > 0) {
-        if (amount <= remainingPrincipalToRecover) {
-          // Entire payment goes towards recovering principal
-          principalPortion = amount;
-          profitPortion = 0;
-        } else {
-          // Payment fully recovers principal, remainder is profit
-          principalPortion = remainingPrincipalToRecover;
-          profitPortion = amount - remainingPrincipalToRecover;
-        }
-      } else {
-        // Principal already recovered, all payment is profit
-        principalPortion = 0;
-        profitPortion = amount;
-      }
-
-      // Update the Loan's tracking fields
-      activeLoan.totalRepaid += amount;
-      activeLoan.pendingAmount -= amount;
-      activeLoan.principalRecovered += principalPortion;
-      activeLoan.profitRealized += profitPortion;
-      
-      // Auto-close loan if fully paid
-      if (activeLoan.pendingAmount <= 0) {
-        activeLoan.status = 'CLOSED';
-        activeLoan.resolvedAt = date ? new Date(date) : new Date();
-      }
-
-      await activeLoan.save();
+      // The loan update and the ledger entry are saved together, or not at all
+      const transaction = await withTransaction((session) =>
+        applyRepayment({ loanId: loan, amount, date, notes, client }, session)
+      );
+      return res.status(201).json({ success: true, data: transaction });
     }
 
     // Create the transaction record
@@ -81,58 +49,62 @@ const addTransaction = async (req, res) => {
       client: client || null,
       loan: loan || null,
       date: date ? new Date(date) : new Date(),
-      principalPortion,
-      profitPortion,
+      principalPortion: 0,
+      profitPortion: 0,
       notes
     });
 
     res.status(201).json({ success: true, data: transaction });
   } catch (error) {
-    if (error.name === 'ValidationError') {
-      const messages = Object.values(error.errors).map((val) => val.message);
-      return res.status(400).json({ success: false, error: messages });
-    } else {
-      console.error(error);
-      return res.status(500).json({ success: false, error: 'Server Error' });
-    }
+    sendError(res, error, 'Add Transaction Error:');
   }
 };
 
 // @desc    Delete/Undo a transaction
 // @route   DELETE /api/transactions/:id
-// @access  Public
+// @access  Admin
 const deleteTransaction = async (req, res) => {
   try {
-    const transaction = await Transaction.findById(req.params.id);
-    if (!transaction) {
-      return res.status(404).json({ success: false, error: 'Transaction not found' });
-    }
-
-    // Reverse loan calculations if it was a repayment
-    if (transaction.type === 'REPAYMENT' && transaction.loan) {
-      const activeLoan = await Loan.findById(transaction.loan);
-      if (activeLoan) {
-        activeLoan.totalRepaid -= transaction.amount;
-        activeLoan.pendingAmount += transaction.amount;
-        activeLoan.principalRecovered -= (transaction.principalPortion || 0);
-        activeLoan.profitRealized -= (transaction.profitPortion || 0);
-
-        // If the loan was marked closed but now has pending amount, reactivate it
-        if (activeLoan.status === 'CLOSED' && activeLoan.pendingAmount > 0) {
-          activeLoan.status = 'ACTIVE';
-          activeLoan.resolvedAt = undefined;
-        }
-
-        await activeLoan.save();
+    await withTransaction(async (session) => {
+      const transaction = await Transaction.findById(req.params.id).session(session);
+      if (!transaction) {
+        throw new HttpError(404, 'Transaction not found');
       }
-    }
 
-    await transaction.deleteOne();
+      // Reverse loan calculations if it was a repayment
+      if (transaction.type === 'REPAYMENT' && transaction.loan) {
+        const activeLoan = await Loan.findById(transaction.loan).session(session);
+        if (activeLoan) {
+          activeLoan.totalRepaid -= transaction.amount;
+          activeLoan.pendingAmount += transaction.amount;
+          activeLoan.principalRecovered -= (transaction.principalPortion || 0);
+          activeLoan.profitRealized -= (transaction.profitPortion || 0);
+
+          // If the loan was marked closed but now has pending amount, reactivate it
+          if (activeLoan.status === 'CLOSED' && activeLoan.pendingAmount > 0) {
+            activeLoan.status = 'ACTIVE';
+            activeLoan.resolvedAt = undefined;
+          }
+
+          await activeLoan.save({ session });
+        }
+      }
+
+      await transaction.deleteOne({ session });
+
+      // An approved staff collection that is undone shows as reversed to the staff member
+      if (transaction.collectionEntry) {
+        await CollectionEntry.updateOne(
+          { _id: transaction.collectionEntry },
+          { $set: { status: 'REVERSED' } },
+          { session }
+        );
+      }
+    });
 
     res.status(200).json({ success: true, data: {} });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, error: 'Server Error' });
+    sendError(res, error, 'Delete Transaction Error:');
   }
 };
 

@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+// The single PIN that guarded the app before user accounts. Sign-in no longer reads it, except once:
+// the first sign-in after the upgrade copies its PIN into the admin account (see authController).
 const appConfigSchema = new mongoose.Schema(
   {
     systemPinHash: {
