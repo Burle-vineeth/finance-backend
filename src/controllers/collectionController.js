@@ -79,7 +79,7 @@ const addWarnings = async (entries) => {
 const getCollectableLoans = async (req, res) => {
   try {
     const loans = await Loan.find({ status: 'ACTIVE' })
-      .select('client paymentFrequency durationDays expectedReturnAmount expectedDailyMonthlyPayment installmentIsCustom customInstallments totalRepaid pendingAmount startDate collectionStartDate')
+      .select('client paymentFrequency durationDays expectedReturnAmount expectedDailyMonthlyPayment installmentIsCustom customInstallments lateFees totalRepaid pendingAmount startDate collectionStartDate')
       .populate('client', 'name phone address')
       .lean();
     const loanIds = loans.map((loan) => loan._id);

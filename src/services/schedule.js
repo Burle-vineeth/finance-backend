@@ -119,22 +119,14 @@ const regularTimeline = (loan) => {
   };
 };
 
-// A custom installment plan: the dates and amounts were set one by one (see services/customInstallments)
-const planTimeline = (loan) => {
-  const rows = loan.customInstallments
-    .map((row) => ({ date: dayKey(row.date), amount: row.amount }))
-    .sort((a, b) => a.date.localeCompare(b.date));
+// A timeline from a list of dated amounts, oldest first, that add up to `expected`
+const rowsTimeline = (rows, expected) => {
   const total = rows.length;
-  const expected = loan.expectedReturnAmount;
   const cumulative = [0];
   rows.forEach((row) => cumulative.push(round2(cumulative[cumulative.length - 1] + row.amount)));
 
   return {
     total,
-    installment: null,
-    customPlan: true,
-    // A plan ends with its last installment
-    hasTerm: true,
     dueOn: (index) => rows[index].date,
     dueAmount: (count) => (count >= total ? expected : cumulative[count]),
     installmentsDueBy: (day) => {
@@ -151,7 +143,47 @@ const planTimeline = (loan) => {
   };
 };
 
+// A custom installment plan: the dates and amounts were set one by one (see services/customInstallments)
+const planTimeline = (loan) => {
+  const rows = loan.customInstallments
+    .map((row) => ({ date: dayKey(row.date), amount: row.amount }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  return {
+    ...rowsTimeline(rows, loan.expectedReturnAmount),
+    installment: null,
+    customPlan: true,
+    // A plan ends with its last installment
+    hasTerm: true,
+  };
+};
+
+// The loan's agreed installments, without late fees
 const timelineOf = (loan) => (loan.customInstallments?.length ? planTimeline(loan) : regularTimeline(loan));
+
+// The late fees charged on a loan, added up
+const feesTotal = (loan) => round2((loan.lateFees || []).reduce((sum, fee) => sum + fee.amount, 0));
+
+// Everything a loan has falling due: its installments and, on the day each was charged, its late fees. Payments
+// cover whatever fell due first, installments and fees alike (an installment before a fee on the same day).
+// A loan without late fees keeps its own timeline.
+const dueTimelineOf = (loan) => {
+  const timeline = timelineOf(loan);
+  if (!loan.lateFees?.length) return timeline;
+  const rows = [];
+  for (let i = 0; i < timeline.total; i++) {
+    rows.push({ date: timeline.dueOn(i), amount: round2(timeline.dueAmount(i + 1) - timeline.dueAmount(i)) });
+  }
+  rows.push(...loan.lateFees.map((fee) => ({ date: dayKey(fee.date), amount: fee.amount, fee: true })));
+  rows.sort((a, b) => a.date.localeCompare(b.date));
+  return {
+    ...rowsTimeline(rows, round2(loan.expectedReturnAmount + feesTotal(loan))),
+    installment: timeline.installment,
+    customPlan: timeline.customPlan,
+    hasTerm: timeline.hasTerm,
+    // How many of the first `count` rows are installments, for the counts shown (a fee isn't an installment)
+    installmentsAmong: (count) => rows.slice(0, count).filter((row) => !row.fee).length,
+  };
+};
 
 // Where a loan stands today, against its regular schedule or its custom installment plan.
 //   today      'YYYY-MM-DD' in India (defaults to now)
@@ -165,40 +197,45 @@ const timelineOf = (loan) => (loan.customInstallments?.length ? planTimeline(loa
 //   PARTLY_PAID   only today's installment is unpaid, and part of it is paid
 //   OVERDUE       an installment from before today is unpaid (or the term has ended with money owed)
 //   PAID          nothing left to pay
+// Late fees fall due alongside the installments (see dueTimelineOf): they count in what is due, overdue and next,
+// but not in the installment counts, and the term still ends with the last agreed installment.
 const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
-  const timeline = timelineOf(loan);
+  const timeline = dueTimelineOf(loan);
   const { total, hasTerm, dueOn, dueAmount, installmentsDueBy } = timeline;
-  const expected = loan.expectedReturnAmount;
+  const installmentsAmong = timeline.installmentsAmong || ((count) => count);
+  const agreed = timelineOf(loan);
+  const owed = loan.expectedReturnAmount + feesTotal(loan);
   const paid = loan.totalRepaid || 0;
   const firstDueDate = dueOn(0);
-  const lastDueDate = dueOn(total - 1);
+  const lastDueDate = agreed.dueOn(agreed.total - 1);
 
+  // Rows here are installments and late fees alike
   const installmentsPaid = timeline.installmentsPaidBy(paid);
   const installmentsDue = installmentsDueBy(today);
+  const dueBeforeToday = installmentsDueBy(addDays(today, -1));
   const dueSoFar = dueAmount(installmentsDue);
   const amountDue = round2(Math.max(0, dueSoFar - paid));
-  const overdueBeforeToday = round2(Math.max(0, dueAmount(installmentsDueBy(addDays(today, -1))) - paid));
+  const overdueBeforeToday = round2(Math.max(0, dueAmount(dueBeforeToday) - paid));
   const nextDueDate = installmentsPaid < total ? dueOn(installmentsPaid) : null;
-  const unpaidInstallments = Math.max(0, installmentsDue - installmentsPaid);
-  // The next unpaid installment in full (for a plan, each can differ)
+  // The next unpaid installment (or late fee) in full (for a plan, each can differ)
   const nextInstallmentAmount = installmentsPaid < total
     ? round2(dueAmount(installmentsPaid + 1) - dueAmount(installmentsPaid))
     : 0;
   const installment = timeline.installment ?? nextInstallmentAmount;
 
-  // Today's own installment, if one falls today, and how much of it is paid (by any payment, early ones included)
-  const installmentToday = installmentsDue > 0 && dueOn(installmentsDue - 1) === today
-    ? round2(dueAmount(installmentsDue) - dueAmount(installmentsDue - 1))
-    : 0;
+  // What falls due today (an installment, a late fee charged today, or both), and how much of it is paid (by any
+  // payment, early ones included)
+  const installmentToday = round2(dueSoFar - dueAmount(dueBeforeToday));
   const installmentTodayPaid = installmentToday
-    ? round2(Math.min(installmentToday, Math.max(0, paid - dueAmount(installmentsDue - 1))))
+    ? round2(Math.min(installmentToday, Math.max(0, paid - dueAmount(dueBeforeToday))))
     : 0;
 
   let status;
-  if ((loan.pendingAmount ?? expected - paid) <= EPSILON || installmentsPaid >= total) {
+  if ((loan.pendingAmount ?? owed - paid) <= EPSILON || installmentsPaid >= total) {
     status = 'PAID';
   } else if (amountDue > EPSILON) {
-    if (unpaidInstallments === 1 && nextDueDate === today) {
+    // Only what falls today is unpaid
+    if (dueBeforeToday <= installmentsPaid && nextDueDate === today) {
       status = paid > dueAmount(installmentsPaid) + EPSILON ? 'PARTLY_PAID' : 'DUE_TODAY';
     } else {
       status = 'OVERDUE';
@@ -218,9 +255,9 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
     // True when the loan follows a custom installment plan (dates and amounts set one by one)
     customPlan: timeline.customPlan,
     nextInstallmentAmount,
-    installmentsTotal: total,
-    installmentsDue,
-    installmentsPaid,
+    installmentsTotal: installmentsAmong(total),
+    installmentsDue: installmentsAmong(installmentsDue),
+    installmentsPaid: installmentsAmong(installmentsPaid),
     firstDueDate,
     // The last installment's date: the end of the term, or when a loan without a duration should be repaid
     lastDueDate,
@@ -236,19 +273,21 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
     amountDue,
     // Paid beyond what is due so far (the client is ahead by this much)
     aheadAmount: round2(Math.max(0, paid - dueSoFar)),
-    // Unpaid installments from before today, without today's
+    // Unpaid installments (and late fees) from before today, without today's
     overdueBeforeToday,
-    unpaidInstallments,
+    unpaidInstallments: Math.max(0, installmentsAmong(installmentsDue) - installmentsAmong(installmentsPaid)),
+    // Late fees charged on the loan, added up (they're in amountDue and overdueBeforeToday once they fall due)
+    lateFees: feesTotal(loan),
     installmentToday,
     installmentTodayPaid,
     paidToday: round2(paidToday),
   };
 };
 
-// The installments of a loan that fall due from one day to another (both included), oldest first.
-// Only those in the range are read, so a long loan costs no more than its days in the range.
+// The installments (and late fees) of a loan that fall due from one day to another (both included), oldest
+// first. Only those in the range are read, so a long loan costs no more than its days in the range.
 const installmentsBetween = (loan, fromKey, toKey) => {
-  const { dueOn, dueAmount, installmentsDueBy } = timelineOf(loan);
+  const { dueOn, dueAmount, installmentsDueBy } = dueTimelineOf(loan);
   const rows = [];
   for (let i = installmentsDueBy(addDays(fromKey, -1)); i < installmentsDueBy(toKey); i++) {
     rows.push({ date: dueOn(i), amount: round2(dueAmount(i + 1) - dueAmount(i)) });
@@ -280,7 +319,8 @@ const interestRates = (loan, { closedOn = loan.resolvedAt, today = todayKey() } 
     // What was really repaid, which a final payment can take past the expected return
     actual = flatRate(principal, (loan.totalRepaid || 0) - principal, start, dayKey(closedOn));
   } else if (loan.status === 'ACTIVE' && today > lastDueDate) {
-    actual = flatRate(principal, profit, start, today);
+    // Late fees are owed too
+    actual = flatRate(principal, profit + feesTotal(loan), start, today);
   }
   return { agreed: flatRate(principal, profit, start, lastDueDate), actual };
 };
@@ -295,6 +335,7 @@ module.exports = {
   installmentCount,
   installmentPlan,
   loanSchedule,
+  feesTotal,
   installmentsBetween,
   interestRates,
 };
