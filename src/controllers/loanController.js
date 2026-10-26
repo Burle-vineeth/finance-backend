@@ -3,9 +3,9 @@ const Loan = require('../models/Loan');
 const Client = require('../models/Client');
 const Transaction = require('../models/Transaction');
 const CollectionEntry = require('../models/CollectionEntry');
-const { loanSchedule, todayKey, dayKey, installmentCount } = require('../services/schedule');
+const { loanSchedule, interestRates, todayKey, dayKey, installmentCount } = require('../services/schedule');
 const { parseCustomInstallments, planProblems, samePlan, planSummary } = require('../services/customInstallments');
-const { repaidOnDayByLoan } = require('../services/repayments');
+const { repaidOnDayByLoan, lastRepaymentByLoan } = require('../services/repayments');
 const { withTransaction } = require('../utils/withTransaction');
 const { HttpError, sendError } = require('../utils/httpError');
 
@@ -93,11 +93,22 @@ const getLoans = async (req, res) => {
     const loans = await Loan.find().populate('client').sort({ createdAt: -1 }).lean();
     const today = todayKey();
     const active = loans.filter((loan) => loan.status === 'ACTIVE');
-    const paidToday = await repaidOnDayByLoan(today, active.map((loan) => loan._id));
-    // Where each active loan stands against its installment schedule
-    const data = loans.map((loan) => (loan.status === 'ACTIVE'
-      ? { ...loan, schedule: loanSchedule(loan, { today, paidToday: paidToday.get(String(loan._id)) || 0 }) }
-      : loan));
+    // Loans closed before their closing day was recorded (October 2026) closed on their last repayment
+    const undated = loans.filter((loan) => loan.status === 'CLOSED' && !loan.resolvedAt).map((loan) => loan._id);
+    const [paidToday, lastRepaid] = await Promise.all([
+      repaidOnDayByLoan(today, active.map((loan) => loan._id)),
+      undated.length ? lastRepaymentByLoan(undated) : new Map(),
+    ]);
+    const data = loans.map((loan) => {
+      const id = String(loan._id);
+      return {
+        ...loan,
+        // Flat interest a year: agreed for every loan, and actual once it is closed or past its last due date
+        interestRate: interestRates(loan, { closedOn: loan.resolvedAt || lastRepaid.get(id), today }),
+        // Where each active loan stands against its installment schedule
+        ...(loan.status === 'ACTIVE' ? { schedule: loanSchedule(loan, { today, paidToday: paidToday.get(id) || 0 }) } : {}),
+      };
+    });
     res.status(200).json({ success: true, data });
   } catch (error) {
     res.status(500).json({ success: false, error: 'Server Error' });
