@@ -1,7 +1,7 @@
 // The installment schedule on its own: the scenarios from the due-date review, each with what it should show.
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { loanSchedule, todayKey, installmentCount } = require('../src/services/schedule');
+const { loanSchedule, interestRates, installmentsBetween, todayKey, installmentCount } = require('../src/services/schedule');
 
 // Dates picked in the app are stored as UTC midnight of the picked day
 const d = (ymd) => new Date(`${ymd}T00:00:00Z`);
@@ -193,5 +193,84 @@ describe('loan schedule', () => {
     assert.equal(installmentCount('MONTHLY', 180), 6);
     assert.equal(installmentCount('MONTHLY', 45), 2);
     assert.equal(installmentCount('DAILY', 0), 1);
+  });
+});
+
+describe('flat interest a year', () => {
+  // ₹10,000 lent for ₹12,000 back: 20% profit
+  const lent = (overrides) => ({
+    principalAmount: 10000, expectedReturnAmount: 12000, paymentFrequency: 'DAILY', durationDays: 100,
+    expectedDailyMonthlyPayment: 120, startDate: d('2026-10-01'), status: 'ACTIVE', totalRepaid: 0, ...overrides,
+  });
+
+  it('spreads the profit over the agreed term: 20% in 100 days is 73% a year', () => {
+    assert.deepEqual(interestRates(lent(), { today: TODAY }), { agreed: 73, actual: null });
+  });
+
+  it('counts up to today for an active loan past its last due date', () => {
+    // The term ended on 9 Jan; on 20 Apr the money has been out 201 days
+    const late = lent({ totalRepaid: 6000 });
+    assert.deepEqual(interestRates(late, { today: '2027-04-20' }), { agreed: 73, actual: 36.32 });
+    // On its last due date it is still on time
+    assert.equal(interestRates(late, { today: '2027-01-09' }).actual, null);
+  });
+
+  it('counts the wait before collection starts as part of the term', () => {
+    // 100 installments from 11 Oct: the last on 18 Jan, 109 days after disbursement
+    assert.equal(interestRates(lent({ collectionStartDate: d('2026-10-11') })).agreed, 66.97);
+  });
+
+  it('runs a monthly loan to its last installment date', () => {
+    // 4 installments, the last on 1 Feb: 123 days
+    assert.equal(interestRates(lent({ paymentFrequency: 'MONTHLY', durationDays: 120, expectedDailyMonthlyPayment: 3000 })).agreed, 59.35);
+  });
+
+  it('takes the term of a loan without a duration from its installment', () => {
+    // ₹500 a day repays ₹12,000 in 24 days
+    const loan = lent({ durationDays: undefined, expectedDailyMonthlyPayment: 500, installmentIsCustom: true });
+    assert.equal(interestRates(loan).agreed, 304.17);
+  });
+
+  it('ends a custom plan on its last installment', () => {
+    const customInstallments = [
+      { date: d('2026-11-30'), amount: 6000 },
+      { date: d('2026-10-31'), amount: 6000 },
+    ];
+    assert.equal(interestRates(lent({ customInstallments, durationDays: undefined })).agreed, 121.67);
+  });
+
+  it('gives a closed loan its actual rate, from disbursement to the final payment', () => {
+    const closed = lent({ status: 'CLOSED', totalRepaid: 12000, resolvedAt: d('2027-01-29') });
+    // Paid late: 120 days instead of 100
+    assert.deepEqual(interestRates(closed), { agreed: 73, actual: 60.83 });
+    // Paid early: 90 days
+    assert.equal(interestRates(closed, { closedOn: d('2026-12-30') }).actual, 81.11);
+    // Paid more than agreed: ₹2,500 profit over 120 days
+    assert.equal(interestRates({ ...closed, totalRepaid: 12500 }).actual, 76.04);
+  });
+
+  it('has no rate without days to spread the profit over', () => {
+    assert.equal(interestRates(lent({ status: 'CLOSED', totalRepaid: 12000, resolvedAt: d('2026-10-01') })).actual, null);
+    assert.equal(interestRates(lent({ status: 'CLOSED', totalRepaid: 12000 })).actual, null);
+  });
+});
+
+describe('installments between two days', () => {
+  it('lists only the installments in the range, with the last one making up the paise', () => {
+    // ₹1,000 over 3 days: ₹333.33, ₹333.33, ₹333.34 on 2, 3 and 4 Oct
+    const loan = { paymentFrequency: 'DAILY', durationDays: 3, expectedReturnAmount: 1000, expectedDailyMonthlyPayment: 333.33, startDate: d('2026-10-01') };
+    assert.deepEqual(installmentsBetween(loan, '2026-10-01', '2026-10-31'), [
+      { date: '2026-10-02', amount: 333.33 }, { date: '2026-10-03', amount: 333.33 }, { date: '2026-10-04', amount: 333.34 },
+    ]);
+    assert.deepEqual(installmentsBetween(loan, '2026-10-03', '2026-10-03'), [{ date: '2026-10-03', amount: 333.33 }]);
+    assert.deepEqual(installmentsBetween(loan, '2026-10-05', '2026-12-31'), []);
+  });
+
+  it('follows monthly dates and custom plans', () => {
+    const monthly = { paymentFrequency: 'MONTHLY', durationDays: 90, expectedReturnAmount: 3000, expectedDailyMonthlyPayment: 1000, startDate: d('2026-01-31') };
+    assert.deepEqual(installmentsBetween(monthly, '2026-02-01', '2026-03-31').map((r) => r.date), ['2026-02-28', '2026-03-31']);
+    const plan = { paymentFrequency: 'MONTHLY', expectedReturnAmount: 600, startDate: d('2026-10-01'),
+      customInstallments: [{ date: d('2026-11-15'), amount: 400 }, { date: d('2026-10-20'), amount: 200 }] };
+    assert.deepEqual(installmentsBetween(plan, '2026-10-01', '2026-11-30'), [{ date: '2026-10-20', amount: 200 }, { date: '2026-11-15', amount: 400 }]);
   });
 });

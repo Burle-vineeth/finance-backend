@@ -94,4 +94,13 @@ const repaidOnDayByLoan = async (day, loanIds, session = null) => {
   return byLoan;
 };
 
-module.exports = { applyRepayment, repaidOnDayByLoan };
+// Loan id -> the date of its latest repayment, for these loans
+const lastRepaymentByLoan = async (loanIds) => {
+  const latest = await Transaction.aggregate([
+    { $match: { type: 'REPAYMENT', loan: { $in: loanIds } } },
+    { $group: { _id: '$loan', date: { $max: '$date' } } },
+  ]);
+  return new Map(latest.map((row) => [String(row._id), row.date]));
+};
+
+module.exports = { applyRepayment, repaidOnDayByLoan, lastRepaymentByLoan };

@@ -75,3 +75,36 @@ describe('creating a loan', () => {
     assert.equal(res.body.data.durationDays, 30);
   });
 });
+
+describe('interest rate in the loan list', () => {
+  it('shows the agreed rate, and the actual rate once a loan is closed', async () => {
+    const { admin, create } = await setup();
+    const started = (await create({ durationDays: 100 })).body.data;
+    const list = async () => (await request(app).get('/api/loans').set(auth(admin))).body.data;
+
+    assert.deepEqual((await list())[0].interestRate, { agreed: 73, actual: null });
+
+    // Repaid in full the next day: 20% over 1 day
+    const repaid = await request(app).post('/api/transactions').set(auth(admin)).send({
+      type: 'REPAYMENT', loan: started._id, amount: 12000, date: new Date(Date.now() + 86400000),
+    });
+    assert.equal(repaid.status, 201);
+    assert.deepEqual((await list())[0].interestRate, { agreed: 73, actual: 7300 });
+  });
+
+  it('dates a loan closed before closing days were recorded by its last repayment', async () => {
+    const { admin } = await setup();
+    const client = await models.Client.findOne();
+    const loan = await models.Loan.create({
+      client: client._id, principalAmount: 10000, expectedReturnAmount: 12000, paymentFrequency: 'DAILY', durationDays: 100,
+      startDate: new Date('2026-07-01T00:00:00Z'), status: 'CLOSED', totalRepaid: 12000,
+    });
+    await models.Transaction.create([
+      { type: 'REPAYMENT', loan: loan._id, amount: 6000, date: new Date('2026-08-01T00:00:00Z') },
+      { type: 'REPAYMENT', loan: loan._id, amount: 6000, date: new Date('2026-08-30T00:00:00Z') },
+    ]);
+    const [listed] = (await request(app).get('/api/loans').set(auth(admin))).body.data;
+    // 1 Jul to 30 Aug is 60 days: 20% over 60 days
+    assert.deepEqual(listed.interestRate, { agreed: 73, actual: 121.67 });
+  });
+});

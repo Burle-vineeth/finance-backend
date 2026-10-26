@@ -151,6 +151,8 @@ const planTimeline = (loan) => {
   };
 };
 
+const timelineOf = (loan) => (loan.customInstallments?.length ? planTimeline(loan) : regularTimeline(loan));
+
 // Where a loan stands today, against its regular schedule or its custom installment plan.
 //   today      'YYYY-MM-DD' in India (defaults to now)
 //   paidToday  what was repaid on this loan today, for "collected today"
@@ -164,7 +166,7 @@ const planTimeline = (loan) => {
 //   OVERDUE       an installment from before today is unpaid (or the term has ended with money owed)
 //   PAID          nothing left to pay
 const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
-  const timeline = loan.customInstallments?.length ? planTimeline(loan) : regularTimeline(loan);
+  const timeline = timelineOf(loan);
   const { total, hasTerm, dueOn, dueAmount, installmentsDueBy } = timeline;
   const expected = loan.expectedReturnAmount;
   const paid = loan.totalRepaid || 0;
@@ -243,13 +245,56 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
   };
 };
 
+// The installments of a loan that fall due from one day to another (both included), oldest first.
+// Only those in the range are read, so a long loan costs no more than its days in the range.
+const installmentsBetween = (loan, fromKey, toKey) => {
+  const { dueOn, dueAmount, installmentsDueBy } = timelineOf(loan);
+  const rows = [];
+  for (let i = installmentsDueBy(addDays(fromKey, -1)); i < installmentsDueBy(toKey); i++) {
+    rows.push({ date: dueOn(i), amount: round2(dueAmount(i + 1) - dueAmount(i)) });
+  }
+  return rows;
+};
+
+// Flat interest a year, in percent: the profit as a share of the principal, scaled from the loan's days to a
+// year. ₹10,000 lent for ₹12,000 back over 100 days is 20% in 100 days, 73% a year. null without any days
+// to spread it over (repaid the day it was given).
+const flatRate = (principal, profit, fromKey, toKey) => {
+  const days = daysBetween(fromKey, toKey);
+  return principal > 0 && days > 0 ? round2((profit / principal) * (365 / days) * 100) : null;
+};
+
+// A loan's flat interest a year:
+//   agreed  over its agreed term, from disbursement to the last installment's due date
+//   actual  over the days it really took, from disbursement to the final payment (closedOn, for loans closed
+//           before it was recorded; defaults to resolvedAt). For an active loan past its last due date, up to
+//           today, as if repaid in full today: it falls each day the money stays out. Otherwise null.
+const interestRates = (loan, { closedOn = loan.resolvedAt, today = todayKey() } = {}) => {
+  const timeline = timelineOf(loan);
+  const start = dayKey(loan.startDate);
+  const lastDueDate = timeline.dueOn(timeline.total - 1);
+  const principal = loan.principalAmount;
+  const profit = loan.expectedReturnAmount - principal;
+  let actual = null;
+  if (loan.status === 'CLOSED' && closedOn) {
+    // What was really repaid, which a final payment can take past the expected return
+    actual = flatRate(principal, (loan.totalRepaid || 0) - principal, start, dayKey(closedOn));
+  } else if (loan.status === 'ACTIVE' && today > lastDueDate) {
+    actual = flatRate(principal, profit, start, today);
+  }
+  return { agreed: flatRate(principal, profit, start, lastDueDate), actual };
+};
+
 module.exports = {
   BUSINESS_TIME_ZONE,
   dayKey,
   todayKey,
   addDays,
+  daysBetween,
   keyToDate,
   installmentCount,
   installmentPlan,
   loanSchedule,
+  installmentsBetween,
+  interestRates,
 };
