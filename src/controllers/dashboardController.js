@@ -1,9 +1,23 @@
 const Transaction = require('../models/Transaction');
 const Loan = require('../models/Loan');
 const CollectionEntry = require('../models/CollectionEntry');
-const { loanSchedule, todayKey, dayKey, keyToDate } = require('../services/schedule');
+const { loanSchedule, installmentsBetween, todayKey, dayKey, keyToDate, addDays, daysBetween } = require('../services/schedule');
+const { HttpError, sendError } = require('../utils/httpError');
 
 const round2 = (value) => Math.round(value * 100) / 100;
+
+// The longest range the collections chart can ask for: ten years of days
+const MAX_RANGE_DAYS = 3660;
+
+// A 'YYYY-MM-DD' query value (undefined when left out); anything else is refused
+const parseDayKey = (value, name) => {
+  if (value === undefined || value === '') return undefined;
+  const date = typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? keyToDate(value) : null;
+  // A real day: 2026-02-30 doesn't come back as itself
+  const valid = date && !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+  if (!valid) throw new HttpError(400, `${name} must be a date as YYYY-MM-DD`);
+  return value;
+};
 
 // Most urgent first on the dashboard: overdue, then due today, then the rest by next due date
 const URGENCY = { OVERDUE: 0, PARTLY_PAID: 1, DUE_TODAY: 2, UPCOMING: 3, UP_TO_DATE: 3, PAID_AHEAD: 4, PAID: 5 };
@@ -146,6 +160,59 @@ const getDashboardMetrics = async (req, res) => {
   }
 };
 
+// @desc    Money expected and collected, day by day
+// @route   GET /api/dashboard/collections?from=YYYY-MM-DD&to=YYYY-MM-DD
+// @access  Admin
+// Expected is what the loans' installment schedules have falling due each day, closed loans included, as agreed.
+// Collected is the repayments received that day; staff collections count once approved. Without from, the range
+// starts on the day the first loan was given; without to, it ends today.
+const getCollectionTrend = async (req, res) => {
+  try {
+    const today = todayKey();
+    const loans = await Loan.find().lean();
+    const firstLoanDay = loans.reduce((first, loan) => {
+      const day = dayKey(loan.startDate);
+      return day < first ? day : first;
+    }, today);
+    const from = parseDayKey(req.query.from, 'from') || firstLoanDay;
+    const to = parseDayKey(req.query.to, 'to') || today;
+    if (from > to) throw new HttpError(400, 'from must be on or before to');
+    if (daysBetween(from, to) + 1 > MAX_RANGE_DAYS) throw new HttpError(400, 'Choose a range of up to 10 years');
+
+    const days = new Map();
+    for (let day = from; day <= to; day = addDays(day, 1)) days.set(day, { date: day, expected: 0, collected: 0 });
+
+    for (const loan of loans) {
+      for (const { date, amount } of installmentsBetween(loan, from, to)) days.get(date).expected += amount;
+    }
+
+    const repayments = await Transaction.find({
+      type: 'REPAYMENT',
+      // A generous UTC window around the India days, narrowed below
+      date: { $gte: keyToDate(addDays(from, -1)), $lt: keyToDate(addDays(to, 2)) },
+    }).select('amount date').lean();
+    for (const t of repayments) {
+      const row = days.get(dayKey(t.date));
+      if (row) row.collected += t.amount;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        from,
+        to,
+        today,
+        // The day the first loan was given, where "all time" starts
+        firstLoanDay,
+        days: [...days.values()].map((d) => ({ ...d, expected: round2(d.expected), collected: round2(d.collected) })),
+      },
+    });
+  } catch (error) {
+    sendError(res, error, 'Collection Trend Error:');
+  }
+};
+
 module.exports = {
-  getDashboardMetrics
+  getDashboardMetrics,
+  getCollectionTrend,
 };

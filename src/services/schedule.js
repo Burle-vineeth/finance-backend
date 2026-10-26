@@ -245,6 +245,17 @@ const loanSchedule = (loan, { today = todayKey(), paidToday = 0 } = {}) => {
   };
 };
 
+// The installments of a loan that fall due from one day to another (both included), oldest first.
+// Only those in the range are read, so a long loan costs no more than its days in the range.
+const installmentsBetween = (loan, fromKey, toKey) => {
+  const { dueOn, dueAmount, installmentsDueBy } = timelineOf(loan);
+  const rows = [];
+  for (let i = installmentsDueBy(addDays(fromKey, -1)); i < installmentsDueBy(toKey); i++) {
+    rows.push({ date: dueOn(i), amount: round2(dueAmount(i + 1) - dueAmount(i)) });
+  }
+  return rows;
+};
+
 // Flat interest a year, in percent: the profit as a share of the principal, scaled from the loan's days to a
 // year. ₹10,000 lent for ₹12,000 back over 100 days is 20% in 100 days, 73% a year. null without any days
 // to spread it over (repaid the day it was given).
@@ -279,9 +290,11 @@ module.exports = {
   dayKey,
   todayKey,
   addDays,
+  daysBetween,
   keyToDate,
   installmentCount,
   installmentPlan,
   loanSchedule,
+  installmentsBetween,
   interestRates,
 };

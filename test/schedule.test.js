@@ -1,7 +1,7 @@
 // The installment schedule on its own: the scenarios from the due-date review, each with what it should show.
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { loanSchedule, interestRates, todayKey, installmentCount } = require('../src/services/schedule');
+const { loanSchedule, interestRates, installmentsBetween, todayKey, installmentCount } = require('../src/services/schedule');
 
 // Dates picked in the app are stored as UTC midnight of the picked day
 const d = (ymd) => new Date(`${ymd}T00:00:00Z`);
@@ -252,5 +252,25 @@ describe('flat interest a year', () => {
   it('has no rate without days to spread the profit over', () => {
     assert.equal(interestRates(lent({ status: 'CLOSED', totalRepaid: 12000, resolvedAt: d('2026-10-01') })).actual, null);
     assert.equal(interestRates(lent({ status: 'CLOSED', totalRepaid: 12000 })).actual, null);
+  });
+});
+
+describe('installments between two days', () => {
+  it('lists only the installments in the range, with the last one making up the paise', () => {
+    // ₹1,000 over 3 days: ₹333.33, ₹333.33, ₹333.34 on 2, 3 and 4 Oct
+    const loan = { paymentFrequency: 'DAILY', durationDays: 3, expectedReturnAmount: 1000, expectedDailyMonthlyPayment: 333.33, startDate: d('2026-10-01') };
+    assert.deepEqual(installmentsBetween(loan, '2026-10-01', '2026-10-31'), [
+      { date: '2026-10-02', amount: 333.33 }, { date: '2026-10-03', amount: 333.33 }, { date: '2026-10-04', amount: 333.34 },
+    ]);
+    assert.deepEqual(installmentsBetween(loan, '2026-10-03', '2026-10-03'), [{ date: '2026-10-03', amount: 333.33 }]);
+    assert.deepEqual(installmentsBetween(loan, '2026-10-05', '2026-12-31'), []);
+  });
+
+  it('follows monthly dates and custom plans', () => {
+    const monthly = { paymentFrequency: 'MONTHLY', durationDays: 90, expectedReturnAmount: 3000, expectedDailyMonthlyPayment: 1000, startDate: d('2026-01-31') };
+    assert.deepEqual(installmentsBetween(monthly, '2026-02-01', '2026-03-31').map((r) => r.date), ['2026-02-28', '2026-03-31']);
+    const plan = { paymentFrequency: 'MONTHLY', expectedReturnAmount: 600, startDate: d('2026-10-01'),
+      customInstallments: [{ date: d('2026-11-15'), amount: 400 }, { date: d('2026-10-20'), amount: 200 }] };
+    assert.deepEqual(installmentsBetween(plan, '2026-10-01', '2026-11-30'), [{ date: '2026-10-20', amount: 200 }, { date: '2026-11-15', amount: 400 }]);
   });
 });
