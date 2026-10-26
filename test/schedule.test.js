@@ -1,7 +1,7 @@
 // The installment schedule on its own: the scenarios from the due-date review, each with what it should show.
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const { loanSchedule, interestRates, installmentsBetween, todayKey, installmentCount } = require('../src/services/schedule');
+const { loanSchedule, interestRates, installmentsBetween, feesTotal, todayKey, installmentCount } = require('../src/services/schedule');
 
 // Dates picked in the app are stored as UTC midnight of the picked day
 const d = (ymd) => new Date(`${ymd}T00:00:00Z`);
@@ -272,5 +272,52 @@ describe('installments between two days', () => {
     const plan = { paymentFrequency: 'MONTHLY', expectedReturnAmount: 600, startDate: d('2026-10-01'),
       customInstallments: [{ date: d('2026-11-15'), amount: 400 }, { date: d('2026-10-20'), amount: 200 }] };
     assert.deepEqual(installmentsBetween(plan, '2026-10-01', '2026-11-30'), [{ date: '2026-10-20', amount: 200 }, { date: '2026-11-15', amount: 400 }]);
+  });
+});
+
+describe('late fees in the schedule', () => {
+  // ₹600 a day for 100 days from 1 Oct (first due 2 Oct), with a ₹500 fee charged on 10 Oct
+  const fee = (overrides = {}) => ({
+    ...daily({ startDate: d('2026-10-01'), status: 'ACTIVE', ...overrides }),
+    lateFees: [{ amount: 500, date: d('2026-10-10') }],
+    pendingAmount: 60500 - (overrides.totalRepaid ?? 0),
+  });
+
+  it('adds the fee to what falls due on its day, not to the installment counts', () => {
+    // 20 installments by 21 Oct is ₹12,000, plus the fee
+    const s = loanSchedule(fee({ totalRepaid: 12000 }), { today: '2026-10-21' });
+    assert.equal(s.dueSoFar, 12500);
+    assert.equal(s.amountDue, 500);
+    // Oldest first: 2–10 Oct, the fee, then 11–20 Oct are paid, and ₹100 of today's installment
+    assert.equal(s.status, 'PARTLY_PAID');
+    assert.equal(s.overdueBeforeToday, 0);
+    assert.equal(s.installmentsDue, 20);
+    assert.equal(s.installmentsTotal, 100);
+    assert.equal(s.lateFees, 500);
+    // The term still ends with the last installment
+    assert.equal(s.lastDueDate, '2027-01-09');
+  });
+
+  it('covers what fell due first: the installments up to the fee, then the fee', () => {
+    // ₹5,400 pays 2–10 Oct (9 installments); the fee from 10 Oct is next
+    const s = loanSchedule(fee({ totalRepaid: 5400 }), { today: '2026-10-10' });
+    assert.equal(s.installmentsPaid, 9);
+    assert.equal(s.nextInstallmentAmount, 500);
+    assert.equal(s.installmentToday, 1100);
+    assert.equal(s.status, 'DUE_TODAY');
+  });
+
+  it('is paid only once the fee is', () => {
+    const loan = fee({ totalRepaid: 60000 });
+    assert.equal(loanSchedule(loan, { today: '2027-02-01' }).status, 'OVERDUE');
+    assert.equal(loanSchedule({ ...loan, totalRepaid: 60500, pendingAmount: 0 }, { today: '2027-02-01' }).status, 'PAID');
+  });
+
+  it('counts fees in the chart and the overdue rate, not in the agreed rate', () => {
+    const loan = fee({ principalAmount: 50000 });
+    assert.deepEqual(installmentsBetween(loan, '2026-10-10', '2026-10-10'), [{ date: '2026-10-10', amount: 600 }, { date: '2026-10-10', amount: 500 }]);
+    assert.equal(feesTotal(loan), 500);
+    // ₹10,000 profit over the 100-day term; 201 days on, the fee is owed too: 21% over 201 days
+    assert.deepEqual(interestRates(loan, { today: '2027-04-20' }), { agreed: 73, actual: 38.13 });
   });
 });

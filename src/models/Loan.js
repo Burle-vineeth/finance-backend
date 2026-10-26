@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { installmentCount } = require('../services/schedule');
+const { installmentCount, feesTotal } = require('../services/schedule');
 const { planProblems } = require('../services/customInstallments');
 
 const loanSchema = new mongoose.Schema(
@@ -81,6 +81,19 @@ const loanSchema = new mongoose.Schema(
     resolvedAt: {
       type: Date,
     },
+    // Late fees charged on the loan. Each falls due on its date alongside the installments and adds to what the
+    // client owes (see services/schedule); once paid it is profit. Left unset for loans without any.
+    lateFees: {
+      type: [{
+        amount: { type: Number, required: true, min: [0.01, 'A late fee must be more than zero'] },
+        date: { type: Date, required: true },
+        note: { type: String, trim: true, maxlength: [200, 'A note can be at most 200 characters'] },
+        at: { type: Date, default: Date.now },
+        by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        byName: { type: String },
+      }],
+      default: undefined,
+    },
     // Corrections made after the loan was created: what changed, from what to what, when and by whom
     editHistory: [{
       _id: false,
@@ -97,8 +110,9 @@ const loanSchema = new mongoose.Schema(
 
 // Pre-save middleware to auto-calculate fields if they are new or modified
 loanSchema.pre('validate', function() {
-  if (this.isModified('principalAmount') || this.isModified('expectedReturnAmount')) {
-    this.profitAmount = this.expectedReturnAmount - this.principalAmount;
+  if (this.isModified('principalAmount') || this.isModified('expectedReturnAmount') || this.isModified('lateFees')) {
+    // Late fees are profit too
+    this.profitAmount = this.expectedReturnAmount - this.principalAmount + feesTotal(this);
     if (this.isNew) {
       this.pendingAmount = this.expectedReturnAmount;
     }

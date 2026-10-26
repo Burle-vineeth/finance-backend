@@ -371,8 +371,87 @@ const updateLoanDetails = async (req, res) => {
   }
 };
 
+// Fee dates are picked days, stored as UTC midnight, so they print as that day in UTC
+const feeDateFormatter = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+// How a late fee reads in the loan's change history: ₹1,000 on 26 Oct 2026 (3 weeks late)
+const feeText = (fee) => `${rupees(fee.amount)} on ${feeDateFormatter.format(fee.date)}${fee.note ? ` (${fee.note})` : ''}`;
+
+// @desc    Charge a late fee: it falls due on its date alongside the installments and adds to what the client owes.
+//          A closed loan reopens until the fee is paid.
+// @route   POST /api/loans/:id/late-fees   { amount, date: 'YYYY-MM-DD', note? }
+// @access  Admin
+const addLateFee = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) throw new HttpError(404, 'Loan not found');
+    const body = req.body || {};
+    const amount = typeof body.amount === 'number' ? body.amount : NaN;
+    if (!Number.isFinite(amount) || amount <= 0) throw new HttpError(400, 'The late fee must be a number greater than zero');
+    const date = parseDay(body.date, 'The late fee\'s date');
+    if (dayKey(date) > todayKey()) throw new HttpError(400, 'A late fee can\'t be dated in the future');
+    const note = body.note === undefined || body.note === null ? '' : body.note;
+    if (typeof note !== 'string' || note.trim().length > 200) throw new HttpError(400, 'The note must be text of up to 200 characters');
+
+    const loan = await withTransaction(async (session) => {
+      const loan = await Loan.findById(req.params.id).session(session);
+      if (!loan) throw new HttpError(404, 'Loan not found');
+      if (loan.status === 'DEFAULTED') throw new HttpError(409, 'This loan has been written off');
+      if (dayKey(date) < dayKey(loan.startDate)) throw new HttpError(400, 'A late fee can\'t be dated before the loan was given');
+
+      const fee = { amount: Math.round(amount * 100) / 100, date, note: note.trim() || undefined, at: new Date(), by: req.user.id, byName: req.user.name };
+      loan.lateFees = [...(loan.lateFees || []), fee];
+      loan.pendingAmount = Math.round((loan.pendingAmount + fee.amount) * 100) / 100;
+      if (loan.status === 'CLOSED') {
+        loan.status = 'ACTIVE';
+        loan.resolvedAt = undefined;
+      }
+      loan.editHistory.push({ at: new Date(), by: req.user.id, byName: req.user.name, changes: [{ field: 'lateFee', from: '', to: feeText(fee) }] });
+      await loan.save({ session });
+      return loan;
+    });
+    res.status(201).json({ success: true, data: loan });
+  } catch (error) {
+    sendError(res, error, 'Add Late Fee Error:');
+  }
+};
+
+// @desc    Remove a late fee charged by mistake, while the loan still owes at least that much. A loan with nothing
+//          left to pay without it closes, on the day of its last repayment.
+// @route   DELETE /api/loans/:id/late-fees/:feeId
+// @access  Admin
+const removeLateFee = async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) throw new HttpError(404, 'Loan not found');
+    const loan = await withTransaction(async (session) => {
+      const loan = await Loan.findById(req.params.id).session(session);
+      if (!loan) throw new HttpError(404, 'Loan not found');
+      const fee = (loan.lateFees || []).find((f) => String(f._id) === req.params.feeId);
+      if (!fee) throw new HttpError(404, 'Late fee not found');
+      if (loan.pendingAmount + 0.005 < fee.amount) {
+        throw new HttpError(409, 'This fee has already been paid, at least in part. Undo those payments first.');
+      }
+
+      const remaining = loan.lateFees.filter((f) => f !== fee);
+      loan.lateFees = remaining.length ? remaining : undefined;
+      loan.pendingAmount = Math.round((loan.pendingAmount - fee.amount) * 100) / 100;
+      if (loan.status === 'ACTIVE' && loan.pendingAmount <= 0.005) {
+        const last = await Transaction.findOne({ type: 'REPAYMENT', loan: loan._id }).sort({ date: -1 }).select('date').session(session).lean();
+        loan.status = 'CLOSED';
+        loan.resolvedAt = last?.date || new Date();
+      }
+      loan.editHistory.push({ at: new Date(), by: req.user.id, byName: req.user.name, changes: [{ field: 'lateFee', from: feeText(fee), to: '' }] });
+      await loan.save({ session });
+      return loan;
+    });
+    res.json({ success: true, data: loan });
+  } catch (error) {
+    sendError(res, error, 'Remove Late Fee Error:');
+  }
+};
+
 module.exports = {
   getLoans,
   addLoan,
   updateLoanDetails,
+  addLateFee,
+  removeLateFee,
 };
