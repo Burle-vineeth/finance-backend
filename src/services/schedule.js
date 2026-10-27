@@ -335,6 +335,7 @@ module.exports = {
   installmentCount,
   installmentPlan,
   loanSchedule,
+  dueTimelineOf,
   feesTotal,
   installmentsBetween,
   interestRates,
