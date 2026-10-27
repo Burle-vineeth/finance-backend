@@ -4,7 +4,8 @@ const transactionSchema = new mongoose.Schema(
   {
     type: {
       type: String,
-      enum: ['DISBURSEMENT', 'REPAYMENT', 'CAPITAL_INJECTION', 'CAPITAL_WITHDRAWAL', 'BUSINESS_EXPENSE'],
+      // CASH_TRANSFER moves cash between the admin's hand and the staff's, without changing the business's total
+      enum: ['DISBURSEMENT', 'REPAYMENT', 'CAPITAL_INJECTION', 'CAPITAL_WITHDRAWAL', 'BUSINESS_EXPENSE', 'CASH_TRANSFER'],
       required: true,
     },
     amount: {
@@ -36,6 +37,13 @@ const transactionSchema = new mongoose.Schema(
     },
     notes: {
       type: String,
+    },
+    // Whose hand the cash is in. A repayment: where the money went when it was paid, the admin's or the staff's
+    // (as one pool, no one named). A cash transfer: where the money moved to (ADMIN: received from staff;
+    // STAFF: moved to staff). Left out on older entries, which count as the admin's. See services/cash.
+    cashWith: {
+      type: String,
+      enum: ['ADMIN', 'STAFF'],
     },
     // Set when the repayment came from a staff collection that the admin approved
     collectedBy: {

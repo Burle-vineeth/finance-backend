@@ -3,8 +3,11 @@ const Loan = require('../models/Loan');
 const CollectionEntry = require('../models/CollectionEntry');
 const { loanSchedule, installmentsBetween, todayKey, dayKey, keyToDate, addDays, daysBetween } = require('../services/schedule');
 const { HttpError, sendError } = require('../utils/httpError');
+const { scoreFor, TARGET_YEARLY_RATE, GRACE_DAYS } = require('../services/score');
+const { cashSplit } = require('../services/cash');
 
 const round2 = (value) => Math.round(value * 100) / 100;
+const round1 = (value) => Math.round(value * 10) / 10;
 
 // The longest range the collections chart can ask for: ten years of days
 const MAX_RANGE_DAYS = 3660;
@@ -69,6 +72,8 @@ const getDashboardMetrics = async (req, res) => {
 
     const totalCapital = totalCapitalInjected - totalCapitalWithdrawn;
     const cashOnHand = totalCapital - totalDisbursed + totalRepaid - totalExpenses;
+    // The same cash, split between the admin's hand and the staff's (collected, not yet handed over)
+    const { withStaff: cashWithStaff, inHand: cashInHand } = cashSplit(transactions);
     const netProfit = realizedProfit - totalExpenses;
 
     // 2. Calculate Market Metrics from Active Loans
@@ -136,6 +141,8 @@ const getDashboardMetrics = async (req, res) => {
         finances: {
           totalCapital,
           cashOnHand,
+          cashInHand,
+          cashWithStaff,
           moneyInMarket,
           expectedProfitPending,
           realizedProfit,
@@ -212,7 +219,68 @@ const getCollectionTrend = async (req, res) => {
   }
 };
 
+// @desc    The business score for a range of days, out of 100, with what helped and hurt; and the score of a
+//          period to compare it with (the app sends the one just before, e.g. September for October)
+// @route   GET /api/dashboard/score?from=&to=&compareFrom=&compareTo=   (days as YYYY-MM-DD)
+// @access  Admin
+// Worked out only when asked for: nothing else in the app waits on it. Without from, the range starts on the
+// day the first loan was given; without to, it ends today. See services/score for how it is worked out.
+const getBusinessScore = async (req, res) => {
+  try {
+    const today = todayKey();
+    const [loans, transactions] = await Promise.all([
+      Loan.find().populate('client', 'name').lean(),
+      Transaction.find().select('type amount date loan principalPortion').lean(),
+    ]);
+    const firstLoanDay = loans.reduce((first, loan) => {
+      const day = dayKey(loan.startDate);
+      return day < first ? day : first;
+    }, today);
+    const rangeOf = (fromName, toName, defaults) => {
+      const from = parseDayKey(req.query[fromName], fromName) || defaults.from;
+      const to = parseDayKey(req.query[toName], toName) || defaults.to;
+      if (from > to) throw new HttpError(400, `${fromName} must be on or before ${toName}`);
+      if (daysBetween(from, to) + 1 > MAX_RANGE_DAYS) throw new HttpError(400, 'Choose a range of up to 10 years');
+      return { from, to };
+    };
+    const { from, to } = rangeOf('from', 'to', { from: firstLoanDay, to: today });
+    const compare = req.query.compareFrom || req.query.compareTo ? rangeOf('compareFrom', 'compareTo', {}) : null;
+
+    const settings = { targetYearlyRate: TARGET_YEARLY_RATE, graceDays: GRACE_DAYS };
+    if (from > today) {
+      return res.json({ success: true, data: { from, to, today, firstLoanDay, notStarted: true, settings } });
+    }
+    const current = scoreFor({ loans, transactions, from, to, today });
+    // Only a period when the business was already running is worth comparing with
+    const scored = compare && compare.to >= firstLoanDay && compare.from <= today
+      ? scoreFor({ loans, transactions, ...compare, today })
+      : null;
+    const before = scored && scored.total !== null ? scored : null;
+    // Each part's points against the same part then: +5, -2.5 (null when either period couldn't score it)
+    const pointsBefore = new Map((before?.parts || []).map((part) => [part.key, part.points]));
+    const parts = current.parts.map((part) => {
+      const then = pointsBefore.get(part.key);
+      return { ...part, change: part.points !== null && then !== null && then !== undefined ? round1(part.points - then) : null };
+    });
+
+    res.json({
+      success: true,
+      data: {
+        ...current,
+        parts,
+        today,
+        firstLoanDay,
+        previous: before ? { from: before.from, to: before.to, total: before.total, label: before.label } : null,
+        settings,
+      },
+    });
+  } catch (error) {
+    sendError(res, error, 'Business Score Error:');
+  }
+};
+
 module.exports = {
   getDashboardMetrics,
   getCollectionTrend,
+  getBusinessScore,
 };

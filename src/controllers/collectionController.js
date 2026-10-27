@@ -278,7 +278,8 @@ const approveCollection = async (req, res) => {
         client: claimed.client,
         notes: [`Collected by ${collector?.name || 'staff'}`, claimed.notes].filter(Boolean).join(' · '),
         requireActive: true,
-        extra: { collectedBy: claimed.submittedBy, collectionEntry: claimed._id },
+        // A staff member collected it, so the money is with staff until they hand it over
+        extra: { collectedBy: claimed.submittedBy, collectionEntry: claimed._id, cashWith: 'STAFF' },
       }, session);
 
       claimed.transaction = transaction._id;
